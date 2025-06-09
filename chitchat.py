@@ -5,6 +5,7 @@ import json
 import datetime
 import openai # Import the openai library for its exception types
 import tempfile # For handling uploaded PDF files
+import subprocess # For running MCP servers
 import streamlit as st
 from langchain_openai import ChatOpenAI
 from langchain_openai.embeddings import OpenAIEmbeddings
@@ -109,6 +110,10 @@ if "retriever" not in st.session_state: # For RAG
     st.session_state.retriever = None
 if "processed_doc_names" not in st.session_state: # For RAG
     st.session_state.processed_doc_names = []
+if "mcp_config" not in st.session_state: # For MCP servers
+    st.session_state.mcp_config = {}
+if "mcp_servers" not in st.session_state: # Active MCP server processes
+    st.session_state.mcp_servers = {}
 
 # Early History State Update Block:
 # This runs before the title is rendered to ensure provider/model reflect the selected history
@@ -460,6 +465,75 @@ with st.sidebar:
             st.session_state.processed_doc_names = []
             st.rerun()
 
+    st.markdown("---")
+    st.subheader("MCP Server Configuration")
+    
+    # MCP config JSON input
+    mcp_config_input = st.text_area(
+        "MCP Server Config (JSON):",
+        value=json.dumps(st.session_state.mcp_config, indent=2) if st.session_state.mcp_config else '{\n  "example-server": {\n    "command": "npx",\n    "args": ["-y", "@modelcontextprotocol/server-example"]\n  }\n}',
+        height=150,
+        help="Enter MCP server configuration in JSON format. Each server should have a 'command' and optional 'args' array."
+    )
+    
+    if st.button("Apply MCP Configuration"):
+        try:
+            mcp_config = json.loads(mcp_config_input)
+            if not isinstance(mcp_config, dict):
+                st.error("MCP configuration must be a JSON object")
+            else:
+                st.session_state.mcp_config = mcp_config
+                st.success(f"MCP configuration updated with {len(mcp_config)} server(s)")
+                
+                # Stop any existing MCP servers
+                for server_name, process in st.session_state.mcp_servers.items():
+                    if process and process.poll() is None:
+                        process.terminate()
+                        st.info(f"Stopped MCP server: {server_name}")
+                st.session_state.mcp_servers = {}
+                
+                # Start configured MCP servers
+                for server_name, server_config in mcp_config.items():
+                    if isinstance(server_config, dict) and "command" in server_config:
+                        try:
+                            command = [server_config["command"]]
+                            if "args" in server_config and isinstance(server_config["args"], list):
+                                command.extend(server_config["args"])
+                            
+                            # Start the MCP server process
+                            process = subprocess.Popen(
+                                command,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True
+                            )
+                            st.session_state.mcp_servers[server_name] = process
+                            st.success(f"Started MCP server: {server_name}")
+                        except Exception as e:
+                            st.error(f"Failed to start MCP server '{server_name}': {e}")
+                    else:
+                        st.warning(f"Invalid configuration for server '{server_name}'")
+                        
+        except json.JSONDecodeError as e:
+            st.error(f"Invalid JSON: {e}")
+    
+    # Display active MCP servers
+    if st.session_state.mcp_servers:
+        st.write("Active MCP Servers:")
+        for server_name, process in st.session_state.mcp_servers.items():
+            if process and process.poll() is None:
+                st.caption(f"✅ {server_name} (PID: {process.pid})")
+            else:
+                st.caption(f"❌ {server_name} (stopped)")
+    
+    if st.button("Stop All MCP Servers"):
+        for server_name, process in st.session_state.mcp_servers.items():
+            if process and process.poll() is None:
+                process.terminate()
+                st.info(f"Stopped MCP server: {server_name}")
+        st.session_state.mcp_servers = {}
+        st.rerun()
+
 # Display chat messages from current history
 if st.session_state.current_history is not None and st.session_state.histories:
     # Ensure current_history index is valid before accessing
@@ -550,6 +624,42 @@ if st.session_state.current_history is not None and st.session_state.histories:
 
                 
 # --- Tool Definitions ---
+def call_mcp_server(server_name: str, method: str, params: dict = None) -> str:
+    """
+    Calls a configured MCP server with a specific method and parameters.
+    
+    Args:
+        server_name (str): Name of the MCP server as configured
+        method (str): The method/tool to call on the MCP server
+        params (dict, optional): Parameters to pass to the method
+        
+    Returns:
+        str: The response from the MCP server or an error message
+    """
+    try:
+        if server_name not in st.session_state.mcp_servers:
+            return f"Error: MCP server '{server_name}' is not configured or not running"
+        
+        process = st.session_state.mcp_servers[server_name]
+        if process.poll() is not None:
+            return f"Error: MCP server '{server_name}' is not running"
+        
+        # Create MCP request
+        mcp_request = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params or {},
+            "id": 1
+        }
+        
+        # Send request to MCP server (this is a simplified example)
+        # In a real implementation, you would need proper IPC with the MCP server
+        # For now, we'll return a placeholder response
+        return f"MCP call to '{server_name}.{method}' with params {params} (Note: Full MCP protocol implementation needed)"
+        
+    except Exception as e:
+        return f"Error calling MCP server: {e}"
+
 def call_rest_api(method: str, url: str, headers: dict = None, params: dict = None, json_payload: dict = None) -> str:
     """
     Makes an HTTP request to a given REST API endpoint and returns the response text or JSON.
@@ -593,6 +703,34 @@ def call_rest_api(method: str, url: str, headers: dict = None, params: dict = No
     except Exception as e:
         return f"An unexpected error occurred while calling API: {e}"
 
+# Schema for MCP server tool
+mcp_tool_definition = {
+    "type": "function",
+    "function": {
+        "name": "call_mcp_server",
+        "description": "Calls a configured MCP (Model Context Protocol) server to execute tools or retrieve context. Use this to interact with MCP-enabled services that provide specialized capabilities.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "server_name": {
+                    "type": "string",
+                    "description": "The name of the MCP server as configured in the sidebar"
+                },
+                "method": {
+                    "type": "string",
+                    "description": "The method/tool name to call on the MCP server"
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Optional parameters to pass to the MCP server method",
+                    "additionalProperties": True
+                }
+            },
+            "required": ["server_name", "method"]
+        }
+    }
+}
+
 # Schema for the LLM to understand the tool
 rest_api_tool_definition = {
     "type": "function",
@@ -633,6 +771,7 @@ rest_api_tool_definition = {
 # Mapping of tool names to their functions
 available_tools_mapping = {
     "call_rest_api": call_rest_api,
+    "call_mcp_server": call_mcp_server,
 }
 # Accept user input
 prompt_from_redo = st.session_state.pop("force_process_prompt", None)
@@ -716,7 +855,11 @@ if final_prompt_to_process:
             # Conditionally add tools and tool_choice.
             if st.session_state.current_provider not in ["sambanova", "ollama"]:
                 if bound_llm: # Ensure client is not None
-                    bound_llm = bound_llm.bind_tools([rest_api_tool_definition])
+                    tools_to_bind = [rest_api_tool_definition]
+                    # Add MCP tool if MCP servers are configured
+                    if st.session_state.mcp_servers:
+                        tools_to_bind.append(mcp_tool_definition)
+                    bound_llm = bound_llm.bind_tools(tools_to_bind)
 
             with st.spinner("Thinking..."):
                 if not bound_llm:

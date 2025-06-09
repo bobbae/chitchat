@@ -6,6 +6,8 @@ import datetime
 import openai # Import the openai library for its exception types
 import tempfile # For handling uploaded PDF files
 import subprocess # For running MCP servers
+import threading # For handling MCP server communication
+import queue # For thread-safe communication
 import streamlit as st
 from langchain_openai import ChatOpenAI
 from langchain_openai.embeddings import OpenAIEmbeddings
@@ -114,6 +116,8 @@ if "mcp_config" not in st.session_state: # For MCP servers
     st.session_state.mcp_config = {}
 if "mcp_servers" not in st.session_state: # Active MCP server processes
     st.session_state.mcp_servers = {}
+if "mcp_queues" not in st.session_state: # Communication queues for MCP servers
+    st.session_state.mcp_queues = {}
 
 # Early History State Update Block:
 # This runs before the title is rendered to ensure provider/model reflect the selected history
@@ -491,6 +495,7 @@ with st.sidebar:
                         process.terminate()
                         st.info(f"Stopped MCP server: {server_name}")
                 st.session_state.mcp_servers = {}
+                st.session_state.mcp_queues = {}
                 
                 # Start configured MCP servers
                 for server_name, server_config in mcp_config.items():
@@ -500,15 +505,49 @@ with st.sidebar:
                             if "args" in server_config and isinstance(server_config["args"], list):
                                 command.extend(server_config["args"])
                             
-                            # Start the MCP server process
+                            # Start the MCP server process with stdio communication
                             process = subprocess.Popen(
                                 command,
+                                stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
-                                text=True
+                                text=True,
+                                bufsize=1  # Line buffered
                             )
+                            
+                            # Create response queue for this server
+                            response_queue = queue.Queue()
+                            st.session_state.mcp_queues[server_name] = response_queue
+                            
+                            # Start reader thread for this server
+                            reader_thread = threading.Thread(
+                                target=mcp_reader_thread,
+                                args=(process, response_queue, server_name),
+                                daemon=True
+                            )
+                            reader_thread.start()
+                            
                             st.session_state.mcp_servers[server_name] = process
-                            st.success(f"Started MCP server: {server_name}")
+                            
+                            # Send initialization request to verify server is ready
+                            init_request = {
+                                "jsonrpc": "2.0",
+                                "method": "initialize",
+                                "params": {
+                                    "protocolVersion": "0.1.0",
+                                    "capabilities": {}
+                                },
+                                "id": "init_" + server_name
+                            }
+                            
+                            try:
+                                send_mcp_request(process, init_request)
+                                st.success(f"Started MCP server: {server_name}")
+                            except Exception as e:
+                                process.terminate()
+                                del st.session_state.mcp_servers[server_name]
+                                del st.session_state.mcp_queues[server_name]
+                                st.error(f"Failed to initialize MCP server '{server_name}': {e}")
                         except Exception as e:
                             st.error(f"Failed to start MCP server '{server_name}': {e}")
                     else:
@@ -532,6 +571,7 @@ with st.sidebar:
                 process.terminate()
                 st.info(f"Stopped MCP server: {server_name}")
         st.session_state.mcp_servers = {}
+        st.session_state.mcp_queues = {}
         st.rerun()
 
 # Display chat messages from current history
@@ -623,6 +663,30 @@ if st.session_state.current_history is not None and st.session_state.histories:
                                     st.toast("Could not find a user message to redo.", icon="⚠️")
 
                 
+# --- MCP Helper Functions ---
+def mcp_reader_thread(process, response_queue, server_name):
+    """Thread function to read responses from MCP server stdout."""
+    try:
+        for line in iter(process.stdout.readline, ''):
+            if line:
+                try:
+                    response = json.loads(line.strip())
+                    response_queue.put(response)
+                except json.JSONDecodeError:
+                    # Some MCP servers may output non-JSON lines (e.g., logs)
+                    pass
+    except Exception as e:
+        response_queue.put({"error": f"Reader thread error: {str(e)}"})
+
+def send_mcp_request(process, request):
+    """Send a JSON-RPC request to the MCP server via stdin."""
+    try:
+        request_str = json.dumps(request) + '\n'
+        process.stdin.write(request_str)
+        process.stdin.flush()
+    except Exception as e:
+        raise Exception(f"Failed to send request: {str(e)}")
+
 # --- Tool Definitions ---
 def call_mcp_server(server_name: str, method: str, params: dict = None) -> str:
     """
@@ -644,21 +708,67 @@ def call_mcp_server(server_name: str, method: str, params: dict = None) -> str:
         if process.poll() is not None:
             return f"Error: MCP server '{server_name}' is not running"
         
-        # Create MCP request
+        if server_name not in st.session_state.mcp_queues:
+            return f"Error: No communication queue found for MCP server '{server_name}'"
+        
+        response_queue = st.session_state.mcp_queues[server_name]
+        
+        # Generate a unique request ID
+        request_id = f"{server_name}_{method}_{datetime.datetime.now().timestamp()}"
+        
+        # Create MCP request following JSON-RPC 2.0 spec
         mcp_request = {
             "jsonrpc": "2.0",
             "method": method,
             "params": params or {},
-            "id": 1
+            "id": request_id
         }
         
-        # Send request to MCP server (this is a simplified example)
-        # In a real implementation, you would need proper IPC with the MCP server
-        # For now, we'll return a placeholder response
-        return f"MCP call to '{server_name}.{method}' with params {params} (Note: Full MCP protocol implementation needed)"
+        # Send request to MCP server
+        try:
+            send_mcp_request(process, mcp_request)
+        except Exception as e:
+            return f"Error sending request to MCP server '{server_name}': {str(e)}"
+        
+        # Wait for response with timeout
+        timeout = 30  # 30 seconds timeout
+        start_time = datetime.datetime.now()
+        
+        while (datetime.datetime.now() - start_time).total_seconds() < timeout:
+            try:
+                # Check for response in queue
+                response = response_queue.get(timeout=0.1)
+                
+                # Check if this response matches our request
+                if isinstance(response, dict):
+                    if response.get("id") == request_id:
+                        # This is our response
+                        if "error" in response:
+                            error = response["error"]
+                            error_msg = error.get("message", "Unknown error")
+                            error_code = error.get("code", "N/A")
+                            return f"MCP Error (code {error_code}): {error_msg}"
+                        elif "result" in response:
+                            result = response["result"]
+                            if isinstance(result, str):
+                                return result
+                            else:
+                                return json.dumps(result, indent=2)
+                        else:
+                            return "Error: Invalid MCP response format (missing result or error)"
+                    else:
+                        # Not our response, put it back
+                        response_queue.put(response)
+                        
+            except queue.Empty:
+                continue
+            except Exception as e:
+                return f"Error reading MCP response: {str(e)}"
+        
+        return f"Error: Timeout waiting for response from MCP server '{server_name}' (waited {timeout}s)"
         
     except Exception as e:
-        return f"Error calling MCP server: {e}"
+        return f"Error calling MCP server: {str(e)}"
 
 def call_rest_api(method: str, url: str, headers: dict = None, params: dict = None, json_payload: dict = None) -> str:
     """

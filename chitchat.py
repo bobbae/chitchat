@@ -481,7 +481,7 @@ with st.sidebar:
 
     # Save All History
     if st.session_state.histories:
-        history_json = json.dumps(st.session_state.histories, indent=2)
+        history_json = json.dumps(st.session_state.histories, indent=2, ensure_ascii=False)
         st.download_button(
             label="Save All History",
             data=history_json,
@@ -753,7 +753,7 @@ def call_rest_api(method: str, url: str, headers: dict = None, params: dict = No
         response.raise_for_status()  # Raise an exception for HTTP errors (4xx or 5xx)
         # Try to return JSON if possible, otherwise text
         try:
-            return json.dumps(response.json(), indent=2)
+            return json.dumps(response.json(), indent=2, ensure_ascii=False)
         except json.JSONDecodeError:
             return response.text
     except Exception as e:
@@ -898,7 +898,13 @@ if final_prompt_to_process:
             if rag_was_active_for_current_message: # Set the overall flag
                 rag_active_for_this_prompt = True
 
-        def _handle_direct_llm_call(current_lc_messages: list[BaseMessage], hist_valid: bool, current_active_hist_idx: int | None, is_rag_call: bool = False, source_description: str = "llm_direct"):
+        def _handle_direct_llm_call(
+            current_lc_messages: list[BaseMessage],
+            hist_valid: bool,
+            current_active_hist_idx: int | None,
+            is_rag_call: bool = False,
+            source_description: str = "llm_direct"
+        ) -> None:
             """Handles direct LLM invocation, including tool binding and tool call loop."""
             bound_llm = st.session_state.openai_client # type: ignore
             # Conditionally add non-MCP tools.
@@ -916,6 +922,7 @@ if final_prompt_to_process:
                 if not bound_llm:
                     st.error("LLM client is not properly initialized.")
                     st.stop()
+                # Type: ignore - response will always be AIMessage when using ChatOpenAI
                 response_aimessage = bound_llm.invoke(current_lc_messages)
             
             if not response_aimessage or (not response_aimessage.content and not response_aimessage.tool_calls):

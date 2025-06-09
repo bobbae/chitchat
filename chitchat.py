@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
-import os
-import requests # Add this import at the top
-import json
+import asyncio
 import datetime
-import openai # Import the openai library for its exception types
-import tempfile # For handling uploaded PDF files
-import streamlit as st
-import tempfile # For handling uploaded PDF files
-import subprocess # Retained for now, MCPClient might use it or similar
-import threading  # Retained for now
-import queue      # Retained for now
-import asyncio    # For mcp-use if its methods are async
+import json
+import os
+from io import BytesIO
+import tempfile # For handling uploaded PDF files, used in process_documents_for_rag
 
-from langchain_openai import ChatOpenAI
-from langchain_openai.embeddings import OpenAIEmbeddings
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage, ToolCall
+import openai # Import the openai library for its exception types
+import requests 
+import streamlit as st
+
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolCall, ToolMessage
+from langchain_openai import ChatOpenAI
+from langchain_openai.embeddings import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from mcp_use import MCPClient, MCPAgent # For MCP integration
-
-from io import BytesIO
 
 DEFAULT_PROVIDER_URLS = {
     "openai": "https://api.openai.com/v1",
@@ -129,6 +125,8 @@ if "retriever" not in st.session_state: # For RAG
     st.session_state.retriever = None
 if "processed_doc_names" not in st.session_state: # For RAG
     st.session_state.processed_doc_names = []
+if "rag_enabled_by_user" not in st.session_state: # User toggle for RAG
+    st.session_state.rag_enabled_by_user = False
 
 if "mcp_config" not in st.session_state: # For MCPClient configuration (stores the full JSON structure)
     st.session_state.mcp_config = {}
@@ -136,6 +134,8 @@ if "mcp_client" not in st.session_state: # MCPClient instance
     st.session_state.mcp_client: MCPClient | None = None
 if "mcp_agent" not in st.session_state: # MCPAgent instance
     st.session_state.mcp_agent: MCPAgent | None = None
+if "mcp_enabled_by_user" not in st.session_state: # User toggle for MCP
+    st.session_state.mcp_enabled_by_user = False
 if "show_connection_toast" not in st.session_state: # For deferring connection toast
     st.session_state.show_connection_toast = None
 
@@ -424,7 +424,7 @@ with st.sidebar:
             for hist in st.session_state.histories
         ]
         selected_hist = st.selectbox(
-            "Chat Histories",
+            "Chats",
             options=range(len(st.session_state.histories)),
             format_func=lambda x: history_names[x],
             index=st.session_state.current_history or 0
@@ -480,6 +480,16 @@ with st.sidebar:
         type=['pdf', 'txt'],
         key="rag_file_uploader"
     )
+    st.toggle("Enable RAG", key="rag_enabled_by_user", help="If enabled and documents are indexed, RAG context will be used with a direct LLM call.")
+
+    if st.session_state.rag_enabled_by_user and st.session_state.retriever:
+        st.info("RAG is ENABLED and documents are indexed.", icon="📄")
+    elif st.session_state.rag_enabled_by_user and not st.session_state.retriever:
+        st.warning("RAG is enabled by toggle, but no documents are indexed yet. Process documents to use RAG.", icon="⚠️")
+
+    # Add warning if both RAG and MCP are enabled by user
+    if st.session_state.rag_enabled_by_user and st.session_state.mcp_enabled_by_user:
+        st.warning("Both RAG and MCP are enabled. RAG will take precedence. To use MCPAgent, disable RAG.", icon="ℹ️")
 
     if st.button("Process Uploaded Documents for RAG"):
         process_documents_for_rag(uploaded_files)
@@ -522,6 +532,13 @@ with st.sidebar:
         height=200,
         help="Enter MCP server configuration in JSON format, e.g., {\"mcpServers\": {\"server_name\": {\"command\": ...}}}. This will be used to initialize MCPClient from mcp-use."
     )
+    st.toggle("Enable MCP Servers/Agent", key="mcp_enabled_by_user", help="If enabled and an MCP Agent is configured, it will be used for processing requests (unless RAG is active).")
+
+    if st.session_state.mcp_enabled_by_user and st.session_state.mcp_agent:
+        st.info("MCP is ENABLED and Agent is active.", icon="🤖")
+    elif st.session_state.mcp_enabled_by_user and not st.session_state.mcp_agent:
+        st.warning("MCP is enabled by toggle, but MCPAgent is not active (ensure LLM and MCPClient are configured).", icon="⚠️")
+
 
     if st.button("Apply MCP Configuration & Initialize Client"):
         try:
@@ -553,17 +570,14 @@ with st.sidebar:
         except Exception as e: # Catch errors from MCPClient.from_dict or get_tools
             st.error(f"Error during MCPClient initialization: {e}")
 
-    if st.session_state.mcp_agent:
-        st.caption(f"✅ MCPAgent is active and ready.")
-    elif st.session_state.mcp_client:
-        st.caption(f"✅ MCPClient is active, but MCPAgent is not (likely missing LLM configuration).")
-    else:
-        st.caption("MCPClient is not active. Configure and apply above.")
-    if st.session_state.mcp_client and st.session_state.mcp_config and "mcpServers" in st.session_state.mcp_config:
+    # Display configured MCP servers if client exists
+    if st.session_state.mcp_client:
         if st.session_state.mcp_config and "mcpServers" in st.session_state.mcp_config:
             st.caption("Configured MCP Servers (status managed by MCPClient):")
             for server_name in st.session_state.mcp_config["mcpServers"].keys():
                 st.caption(f"  - {server_name}")
+    elif not st.session_state.mcp_enabled_by_user:
+         st.caption("MCP is currently DISABLED by toggle.")
     else:
         st.caption("MCPClient/Agent is not active. Configure and apply above.")
 
@@ -788,7 +802,7 @@ if final_prompt_to_process:
             Attempts to augment the given query_string with RAG context.
             Returns the (potentially augmented) query string and a boolean indicating if RAG was active.
             """
-            if st.session_state.retriever: # Check if retriever is available
+            if st.session_state.rag_enabled_by_user and st.session_state.retriever: # Check toggle and retriever
                 with st.spinner("Retrieving relevant documents for RAG..."):
                     retrieved_docs = st.session_state.retriever.invoke(query_string)
                 if retrieved_docs:
@@ -890,10 +904,10 @@ if final_prompt_to_process:
             if not st.session_state.current_model:
                     st.error("Please set a valid model name in the sidebar.")
                     st.stop()
-            elif rag_active_for_this_prompt: # RAG was active, send directly to LLM
+            elif st.session_state.rag_enabled_by_user and rag_active_for_this_prompt: # RAG toggle is ON and RAG context was found
                 st.toast("Using LLM directly with RAG context.", icon="📄")
                 _handle_direct_llm_call(langchain_conversation_messages, current_hist_valid_for_prompt, active_history_idx, is_rag_call=True)
-            elif st.session_state.mcp_agent : # RAG not active, MCPAgent is active
+            elif st.session_state.mcp_enabled_by_user and st.session_state.mcp_agent : # MCP Toggle ON and MCPAgent is active (and RAG was not used for this prompt)
                 with st.spinner("Agent is working..."):
                     try:
                         st.toast("Using Agent to process your request.", icon="🤖")
@@ -910,7 +924,7 @@ if final_prompt_to_process:
                              st.session_state.histories[active_history_idx]["messages"].append(
                                 {"role": "assistant", "content": f"[Error during Agent execution: {e}]"}
                             )
-            else: # RAG not active, MCPAgent not active -> Fallback to direct LLM
+            else: # Fallback: RAG not used for this prompt AND (MCP toggle OFF OR MCPAgent not active) -> Direct LLM
                 st.toast("Using LLM directly to process your request.", icon="🧠") # Adjusted icon for clarity
                 _handle_direct_llm_call(langchain_conversation_messages, current_hist_valid_for_prompt, active_history_idx, is_rag_call=False)
             

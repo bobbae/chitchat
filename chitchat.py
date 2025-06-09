@@ -957,7 +957,7 @@ if final_prompt_to_process:
                     function_to_call = available_tools_mapping.get(function_name)
                     if function_to_call:
                         try:
-                            if function_name == "call_rest_api": st.toast(f"Attempting to use tool: {function_name}", icon="🌐")
+                            if function_name == "call_rest_api": st.toast(f"Attempting to use tool: {function_name}", icon="🚀")
                             function_args = tool_call_data["args"]; tool_output = function_to_call(**function_args)
                         except Exception as e: tool_output = f"Error parsing arguments or calling tool {function_name}: {e}"
                     else: tool_output = f"Error: Tool '{function_name}' not found in available_tools_mapping."

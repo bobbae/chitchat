@@ -5,10 +5,13 @@ import json
 import datetime
 import openai # Import the openai library for its exception types
 import tempfile # For handling uploaded PDF files
-import subprocess # For running MCP servers
-import threading # For handling MCP server communication
-import queue # For thread-safe communication
 import streamlit as st
+import tempfile # For handling uploaded PDF files
+import subprocess # Retained for now, MCPClient might use it or similar
+import threading  # Retained for now
+import queue      # Retained for now
+import asyncio    # For mcp-use if its methods are async
+
 from langchain_openai import ChatOpenAI
 from langchain_openai.embeddings import OpenAIEmbeddings
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage, ToolCall
@@ -16,6 +19,8 @@ from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+from mcp_use import MCPClient, MCPAgent # For MCP integration
+
 from io import BytesIO
 
 DEFAULT_PROVIDER_URLS = {
@@ -44,6 +49,21 @@ DEFAULT_PROVIDER_MODELS = {
 
 st.set_page_config(page_title="Chit-Chat with Models", layout="wide")
 
+def try_initialize_mcp_agent():
+    """Initializes or updates the MCPAgent if both LLM and MCPClient are available."""
+    if st.session_state.openai_client and st.session_state.mcp_client:
+        try:
+            st.session_state.mcp_agent = MCPAgent(
+                llm=st.session_state.openai_client,
+                client=st.session_state.mcp_client,
+                max_steps=10  # Default max steps for the agent
+            )
+            # st.sidebar.info("MCPAgent initialized/updated.") # Can be noisy, enable if needed
+        except Exception as e:
+            st.sidebar.error(f"Failed to initialize MCPAgent: {e}")
+            st.session_state.mcp_agent = None
+    else:
+        st.session_state.mcp_agent = None # Ensure it's None if dependencies are missing
 
 def initialize_client(provider, model_name, api_key_input, base_url_input):
     """Initializes the OpenAI client based on selected provider and settings."""
@@ -51,19 +71,15 @@ def initialize_client(provider, model_name, api_key_input, base_url_input):
     provider_env_var_name = PROVIDER_API_KEY_ENV_VARS.get(provider)
 
     if not current_api_key and provider_env_var_name:
-        current_api_key = os.environ.get(provider_env_var_name)
+        current_api_key = os.environ.get(provider_env_var_name, "ollama" if provider == "ollama" else None)
 
-    if provider == "ollama":
-        if not current_api_key:
-            current_api_key = "ollama" # Placeholder for Ollama
-            st.sidebar.info("Using placeholder API key for Ollama.")
-    elif not current_api_key:
+    if provider == "ollama" and current_api_key == "ollama":
+        st.sidebar.info("Using placeholder API key for Ollama.")
+    elif not current_api_key and provider != "ollama": # Ollama can proceed with "ollama" key
         st.sidebar.error(f"API key for {provider} is missing. Please set it in the sidebar or as an environment variable ({provider_env_var_name}).")
         return None
 
-    current_base_url = base_url_input
-    if not current_base_url:
-        current_base_url = DEFAULT_PROVIDER_URLS.get(provider)
+    current_base_url = base_url_input or DEFAULT_PROVIDER_URLS.get(provider)
 
     if not current_base_url and provider != "ollama":
         st.sidebar.error(f"Base URL for {provider} could not be determined. Please specify it.")
@@ -71,7 +87,6 @@ def initialize_client(provider, model_name, api_key_input, base_url_input):
     
     if provider == "gemini" and (not current_base_url or "generativelanguage.googleapis.com" not in current_base_url):
         st.sidebar.warning(f"For Gemini, ensure the Base URL points to an OpenAI-compatible endpoint if not using a direct proxy like `https://generativelanguage.googleapis.com/v1beta/models` with `openai/` suffix for compatibility.")
-
 
     try:
         client = ChatOpenAI(
@@ -81,7 +96,9 @@ def initialize_client(provider, model_name, api_key_input, base_url_input):
             temperature=0.7 # You can set a default temperature or make it configurable
         )
         st.sidebar.success(f"Client initialized for {provider} with model {model_name} at {current_base_url}")
+        st.session_state.show_connection_toast = {"provider": provider, "model": model_name}
         return client
+        # try_initialize_mcp_agent() # Called after client is set in the main logic
     except Exception as e:
         st.sidebar.error(f"Failed to initialize client: {e}")
         return None
@@ -112,18 +129,18 @@ if "retriever" not in st.session_state: # For RAG
     st.session_state.retriever = None
 if "processed_doc_names" not in st.session_state: # For RAG
     st.session_state.processed_doc_names = []
-if "mcp_config" not in st.session_state: # For MCP servers
-    st.session_state.mcp_config = {}
-if "mcp_servers" not in st.session_state: # Active MCP server processes
-    st.session_state.mcp_servers = {}
-if "mcp_queues" not in st.session_state: # Communication queues for MCP servers
-    st.session_state.mcp_queues = {}
 
-# Early History State Update Block:
-# This runs before the title is rendered to ensure provider/model reflect the selected history
-# if a history activation is pending. The full client (re)initialization and reset of
-# pending_history_activation_index will still happen in the sidebar's main activation logic.
-_pending_idx = st.session_state.get("pending_history_activation_index")
+if "mcp_config" not in st.session_state: # For MCPClient configuration (stores the full JSON structure)
+    st.session_state.mcp_config = {}
+if "mcp_client" not in st.session_state: # MCPClient instance
+    st.session_state.mcp_client: MCPClient | None = None
+if "mcp_agent" not in st.session_state: # MCPAgent instance
+    st.session_state.mcp_agent: MCPAgent | None = None
+if "show_connection_toast" not in st.session_state: # For deferring connection toast
+    st.session_state.show_connection_toast = None
+
+_pending_idx = st.session_state.get("pending_history_activation_index") # For history activation
+
 if _pending_idx is not None:
     _histories = st.session_state.get("histories", [])
     if 0 <= _pending_idx < len(_histories):
@@ -135,8 +152,12 @@ if _pending_idx is not None:
             st.session_state.current_provider = _active_history_obj["provider"]
             st.session_state.current_model = _active_history_obj["model"]
             st.session_state.base_url = DEFAULT_PROVIDER_URLS.get(st.session_state.current_provider, "")
-            # Note: We do NOT reset pending_history_activation_index or call initialize_client here.
-            # Those are handled by the main activation logic in the sidebar.
+
+# Display connection toast if a connection was just made
+if st.session_state.get("show_connection_toast"):
+    toast_info = st.session_state.show_connection_toast
+    st.toast(f"Successfully connected to {toast_info['provider']} with model {toast_info['model']}!", icon="✅")
+    st.session_state.show_connection_toast = None # Clear the flag
 
 # Dynamically set the main page title based on connection status and current/target LLM
 provider_for_title = st.session_state.current_provider
@@ -235,30 +256,6 @@ def process_loaded_history_data(loaded_data, source_name="file"):
     else:
         st.info(f"No new or updatable chat histories found in '{source_name}'.")
 
-# --- MCP Helper Functions ---
-def mcp_reader_thread(process, response_queue, server_name):
-    """Thread function to read responses from MCP server stdout."""
-    try:
-        for line in iter(process.stdout.readline, ''):
-            if line:
-                try:
-                    response = json.loads(line.strip())
-                    response_queue.put(response)
-                except json.JSONDecodeError:
-                    # Some MCP servers may output non-JSON lines (e.g., logs)
-                    pass
-    except Exception as e:
-        response_queue.put({"error": f"Reader thread error: {str(e)}"})
-
-def send_mcp_request(process, request):
-    """Send a JSON-RPC request to the MCP server via stdin."""
-    try:
-        request_str = json.dumps(request) + '\n'
-        process.stdin.write(request_str)
-        process.stdin.flush()
-    except Exception as e:
-        raise Exception(f"Failed to send request: {str(e)}")
-
 def process_documents_for_rag(uploaded_files):
     """Loads, splits, embeds, and indexes uploaded documents for RAG."""
     if not uploaded_files:
@@ -345,6 +342,7 @@ with st.sidebar:
                 st.session_state.api_key, # User's current API key from sidebar
                 st.session_state.base_url
             )
+            try_initialize_mcp_agent() # Attempt to init agent after LLM is ready
 
         else:
             st.error(f"Attempted to activate invalid history index: {new_active_idx}")
@@ -386,6 +384,7 @@ with st.sidebar:
                 st.session_state.api_key,
                 st.session_state.base_url
             )
+            try_initialize_mcp_agent() # Attempt to init agent after LLM is ready
             if st.session_state.openai_client:
                 # Check if a history with the same provider and model already exists
                 existing_history_index = -1
@@ -481,123 +480,112 @@ with st.sidebar:
         type=['pdf', 'txt'],
         key="rag_file_uploader"
     )
+
     if st.button("Process Uploaded Documents for RAG"):
         process_documents_for_rag(uploaded_files)
 
     if st.session_state.processed_doc_names:
         st.write("Currently indexed documents for RAG:")
-        for name in st.session_state.processed_doc_names:
-            st.caption(f"- {name}")
-        if st.button("Clear RAG Index & Processed Documents"):
+        for i, name in enumerate(st.session_state.processed_doc_names):
+            col1, col2 = st.columns([0.8, 0.2])
+            with col1:
+                st.caption(f"- {name}")
+            with col2:
+                if st.button("❌", key=f"remove_rag_doc_{i}", help=f"Remove '{name}' from RAG list and clear RAG index."):
+                    st.session_state.processed_doc_names.pop(i)
+                    st.session_state.retriever = None # Clear the RAG index
+                    st.sidebar.info(f"Removed '{name}' from RAG list. The RAG index has been cleared. Please re-process documents if needed.")
+                    st.rerun()
+        if st.button("Clear All RAG Data (Index & Processed Documents)"):
             st.session_state.retriever = None
             st.session_state.processed_doc_names = []
             st.rerun()
 
     st.markdown("---")
-    st.subheader("MCP Server Configuration")
-    
-    # MCP config JSON input
-    mcp_config_input = st.text_area(
-        "MCP Server Config (JSON):",
-        value=json.dumps(st.session_state.mcp_config, indent=2) if st.session_state.mcp_config else '{\n  "example-server": {\n    "command": "npx",\n    "args": ["-y", "@modelcontextprotocol/server-example"]\n  }\n}',
-        height=150,
-        help="Enter MCP server configuration in JSON format. Each server should have a 'command' and optional 'args' array."
-    )
-    
-    if st.button("Apply MCP Configuration"):
-        try:
-            mcp_config = json.loads(mcp_config_input)
-            if not isinstance(mcp_config, dict):
-                st.error("MCP configuration must be a JSON object")
-            else:
-                st.session_state.mcp_config = mcp_config
-                st.success(f"MCP configuration updated with {len(mcp_config)} server(s)")
-                
-                # Stop any existing MCP servers
-                for server_name, process in st.session_state.mcp_servers.items():
-                    if process and process.poll() is None:
-                        process.terminate()
-                        st.info(f"Stopped MCP server: {server_name}")
-                st.session_state.mcp_servers = {}
-                st.session_state.mcp_queues = {}
-                
-                # Start configured MCP servers
-                for server_name, server_config in mcp_config.items():
-                    if isinstance(server_config, dict) and "command" in server_config:
-                        try:
-                            command = [server_config["command"]]
-                            if "args" in server_config and isinstance(server_config["args"], list):
-                                command.extend(server_config["args"])
-                            
-                            # Start the MCP server process with stdio communication
-                            process = subprocess.Popen(
-                                command,
-                                stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                                bufsize=1  # Line buffered
-                            )
-                            
-                            # Create response queue for this server
-                            response_queue = queue.Queue()
-                            st.session_state.mcp_queues[server_name] = response_queue
-                            
-                            # Start reader thread for this server
-                            reader_thread = threading.Thread(
-                                target=mcp_reader_thread,
-                                args=(process, response_queue, server_name),
-                                daemon=True
-                            )
-                            reader_thread.start()
-                            
-                            st.session_state.mcp_servers[server_name] = process
-                            
-                            # Send initialization request to verify server is ready
-                            init_request = {
-                                "jsonrpc": "2.0",
-                                "method": "initialize",
-                                "params": {
-                                    "protocolVersion": "0.1.0",
-                                    "capabilities": {}
-                                },
-                                "id": "init_" + server_name
-                            }
-                            
-                            try:
-                                send_mcp_request(process, init_request)
-                                st.success(f"Started MCP server: {server_name}")
-                            except Exception as e:
-                                process.terminate()
-                                del st.session_state.mcp_servers[server_name]
-                                del st.session_state.mcp_queues[server_name]
-                                st.error(f"Failed to initialize MCP server '{server_name}': {e}")
-                        except Exception as e:
-                            st.error(f"Failed to start MCP server '{server_name}': {e}")
-                    else:
-                        st.warning(f"Invalid configuration for server '{server_name}'")
-                        
-        except json.JSONDecodeError as e:
-            st.error(f"Invalid JSON: {e}")
-    
-    # Display active MCP servers
-    if st.session_state.mcp_servers:
-        st.write("Active MCP Servers:")
-        for server_name, process in st.session_state.mcp_servers.items():
-            if process and process.poll() is None:
-                st.caption(f"✅ {server_name} (PID: {process.pid})")
-            else:
-                st.caption(f"❌ {server_name} (stopped)")
-    
-    if st.button("Stop All MCP Servers"):
-        for server_name, process in st.session_state.mcp_servers.items():
-            if process and process.poll() is None:
-                process.terminate()
-                st.info(f"Stopped MCP server: {server_name}")
-        st.session_state.mcp_servers = {}
-        st.session_state.mcp_queues = {}
-        st.rerun()
+    st.subheader("MCP Client Configuration")
 
+    # MCP config JSON input - mcp_config now stores the full {"mcpServers": ...} structure
+    mcp_config_input_val = json.dumps(st.session_state.mcp_config, indent=2) if st.session_state.mcp_config else \
+        json.dumps({
+            "mcpServers": {
+                "playwright": {
+                    "command": "npx",
+                    "args": ["@playwright/mcp@latest"],
+                    "env": {"DISPLAY": ":1"}
+                }
+            }
+        }, indent=2)
+
+    mcp_config_input_area = st.text_area(
+        "MCP Server Config (JSON for mcp-use):",
+        value=mcp_config_input_val,
+        height=200,
+        help="Enter MCP server configuration in JSON format, e.g., {\"mcpServers\": {\"server_name\": {\"command\": ...}}}. This will be used to initialize MCPClient from mcp-use."
+    )
+
+    if st.button("Apply MCP Configuration & Initialize Client"):
+        try:
+            loaded_mcp_json = json.loads(mcp_config_input_area)
+            if not isinstance(loaded_mcp_json, dict) or "mcpServers" not in loaded_mcp_json:
+                st.error("MCP configuration must be a JSON object with a top-level 'mcpServers' key.")
+            else:
+                st.session_state.mcp_config = loaded_mcp_json # Store the full config
+
+                # Attempt to close/stop the old client if it exists and has a close method
+                if st.session_state.mcp_client and hasattr(st.session_state.mcp_client, 'close'):
+                    try:
+                        if asyncio.iscoroutinefunction(st.session_state.mcp_client.close):
+                            asyncio.run(st.session_state.mcp_client.close())
+                        else:
+                            st.session_state.mcp_client.close()
+                        st.info("Previous MCPClient resources released.")
+                    except Exception as e:
+                        st.warning(f"Error closing previous MCPClient: {e}")
+                
+                st.session_state.mcp_client = MCPClient.from_dict(st.session_state.mcp_config)
+                num_servers = len(st.session_state.mcp_config.get("mcpServers", {}))
+                st.success(f"MCPClient initialized with {num_servers} server definition(s).")
+                try_initialize_mcp_agent() # Attempt to init agent after MCPClient is ready
+                st.rerun()
+
+        except json.JSONDecodeError as e:
+            st.error(f"Invalid JSON for MCP config: {e}")
+        except Exception as e: # Catch errors from MCPClient.from_dict or get_tools
+            st.error(f"Error during MCPClient initialization: {e}")
+
+    if st.session_state.mcp_agent:
+        st.caption(f"✅ MCPAgent is active and ready.")
+    elif st.session_state.mcp_client:
+        st.caption(f"✅ MCPClient is active, but MCPAgent is not (likely missing LLM configuration).")
+    else:
+        st.caption("MCPClient is not active. Configure and apply above.")
+    if st.session_state.mcp_client and st.session_state.mcp_config and "mcpServers" in st.session_state.mcp_config:
+        if st.session_state.mcp_config and "mcpServers" in st.session_state.mcp_config:
+            st.caption("Configured MCP Servers (status managed by MCPClient):")
+            for server_name in st.session_state.mcp_config["mcpServers"].keys():
+                st.caption(f"  - {server_name}")
+    else:
+        st.caption("MCPClient/Agent is not active. Configure and apply above.")
+
+    if st.session_state.mcp_client or st.session_state.mcp_agent:
+        if st.button("Stop MCP Client & Agent"):
+            if st.session_state.mcp_client and hasattr(st.session_state.mcp_client, 'close'):
+                try:
+                    if asyncio.iscoroutinefunction(st.session_state.mcp_client.close):
+                        asyncio.run(st.session_state.mcp_client.close())
+                    else:
+                        st.session_state.mcp_client.close()
+                    st.info("MCPClient resources released.")
+                except Exception as e:
+                    st.warning(f"Error closing MCPClient: {e}")
+            
+            st.session_state.mcp_client = None
+            st.session_state.mcp_agent = None
+            # Optionally clear mcp_config: st.session_state.mcp_config = {}
+            st.success("MCP Client and Agent have been stopped.")
+            st.rerun()
+
+# --- Main Chat Display Logic ---
 # Display chat messages from current history
 if st.session_state.current_history is not None and st.session_state.histories:
     # Ensure current_history index is valid before accessing
@@ -687,88 +675,6 @@ if st.session_state.current_history is not None and st.session_state.histories:
                                     st.toast("Could not find a user message to redo.", icon="⚠️")
 
 # --- Tool Definitions ---
-def call_mcp_server(server_name: str, method: str, params: dict = None) -> str:
-    """
-    Calls a configured MCP server with a specific method and parameters.
-    
-    Args:
-        server_name (str): Name of the MCP server as configured
-        method (str): The method/tool to call on the MCP server
-        params (dict, optional): Parameters to pass to the method
-        
-    Returns:
-        str: The response from the MCP server or an error message
-    """
-    try:
-        if server_name not in st.session_state.mcp_servers:
-            return f"Error: MCP server '{server_name}' is not configured or not running"
-        
-        process = st.session_state.mcp_servers[server_name]
-        if process.poll() is not None:
-            return f"Error: MCP server '{server_name}' is not running"
-        
-        if server_name not in st.session_state.mcp_queues:
-            return f"Error: No communication queue found for MCP server '{server_name}'"
-        
-        response_queue = st.session_state.mcp_queues[server_name]
-        
-        # Generate a unique request ID
-        request_id = f"{server_name}_{method}_{datetime.datetime.now().timestamp()}"
-        
-        # Create MCP request following JSON-RPC 2.0 spec
-        mcp_request = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params or {},
-            "id": request_id
-        }
-        
-        # Send request to MCP server
-        try:
-            send_mcp_request(process, mcp_request)
-        except Exception as e:
-            return f"Error sending request to MCP server '{server_name}': {str(e)}"
-        
-        # Wait for response with timeout
-        timeout = 30  # 30 seconds timeout
-        start_time = datetime.datetime.now()
-        
-        while (datetime.datetime.now() - start_time).total_seconds() < timeout:
-            try:
-                # Check for response in queue
-                response = response_queue.get(timeout=0.1)
-                
-                # Check if this response matches our request
-                if isinstance(response, dict):
-                    if response.get("id") == request_id:
-                        # This is our response
-                        if "error" in response:
-                            error = response["error"]
-                            error_msg = error.get("message", "Unknown error")
-                            error_code = error.get("code", "N/A")
-                            return f"MCP Error (code {error_code}): {error_msg}"
-                        elif "result" in response:
-                            result = response["result"]
-                            if isinstance(result, str):
-                                return result
-                            else:
-                                return json.dumps(result, indent=2)
-                        else:
-                            return "Error: Invalid MCP response format (missing result or error)"
-                    else:
-                        # Not our response, put it back
-                        response_queue.put(response)
-                        
-            except queue.Empty:
-                continue
-            except Exception as e:
-                return f"Error reading MCP response: {str(e)}"
-        
-        return f"Error: Timeout waiting for response from MCP server '{server_name}' (waited {timeout}s)"
-        
-    except Exception as e:
-        return f"Error calling MCP server: {str(e)}"
-
 def call_rest_api(method: str, url: str, headers: dict = None, params: dict = None, json_payload: dict = None) -> str:
     """
     Makes an HTTP request to a given REST API endpoint and returns the response text or JSON.
@@ -798,50 +704,11 @@ def call_rest_api(method: str, url: str, headers: dict = None, params: dict = No
             return json.dumps(response.json(), indent=2)
         except json.JSONDecodeError:
             return response.text
-    except requests.exceptions.HTTPError as http_err:
-        error_message = f"HTTP error occurred: {http_err}"
-        if http_err.response is not None:
-            error_message += f" - Status Code: {http_err.response.status_code} - Response: {http_err.response.text}"
-        return error_message
-    except requests.exceptions.ConnectionError as conn_err:
-        return f"Connection error occurred: {conn_err}"
-    except requests.exceptions.Timeout as timeout_err:
-        return f"Timeout error occurred: {timeout_err}"
-    except requests.exceptions.RequestException as req_err:
-        return f"An error occurred during the API request: {req_err}"
     except Exception as e:
         return f"An unexpected error occurred while calling API: {e}"
 
-# Schema for MCP server tool
-mcp_tool_definition = {
-    "type": "function",
-    "function": {
-        "name": "call_mcp_server",
-        "description": "Calls a configured MCP (Model Context Protocol) server to execute tools or retrieve context. Use this to interact with MCP-enabled services that provide specialized capabilities.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "server_name": {
-                    "type": "string",
-                    "description": "The name of the MCP server as configured in the sidebar"
-                },
-                "method": {
-                    "type": "string",
-                    "description": "The method/tool name to call on the MCP server"
-                },
-                "params": {
-                    "type": "object",
-                    "description": "Optional parameters to pass to the MCP server method",
-                    "additionalProperties": True
-                }
-            },
-            "required": ["server_name", "method"]
-        }
-    }
-}
-
-# Schema for the LLM to understand the tool
-rest_api_tool_definition = {
+# Schema for the REST API tool (if used directly, or as a reference for mcp-use tool structure)
+rest_api_tool_definition = { # This is a Pydantic model schema, not a BaseTool instance
     "type": "function",
     "function": {
         "name": "call_rest_api",
@@ -851,37 +718,44 @@ rest_api_tool_definition = {
             "properties": {
                 "method": {
                     "type": "string",
-                    "description": "The HTTP method (e.g., 'GET', 'POST', 'PUT', 'DELETE').",
-                    "enum": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]
+                    "description": "HTTP method (GET, POST, PUT, DELETE, etc.).",
+                    "enum": ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
                 },
                 "url": {
                     "type": "string",
-                    "description": "The full URL of the API endpoint to call."
+                    "description": "The URL of the API endpoint."
                 },
                 "headers": {
                     "type": "object",
-                    "description": "Optional. A dictionary of HTTP headers. Example: {\"Authorization\": \"Bearer YOUR_TOKEN\", \"Content-Type\": \"application/json\"}.",
-                    "additionalProperties": {"type": "string"}
+                    "description": "Headers to include in the API request.",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
                 },
                 "params": {
                     "type": "object",
-                    "description": "Optional. For GET requests, a dictionary of URL parameters. Example: {\"search_query\": \"entries\", \"limit\": \"10\"}.",
-                    "additionalProperties": {"type": "string"}
+                    "description": "Query parameters for the API request.",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
                 },
                 "json_payload": {
                     "type": "object",
-                    "description": "Optional. For POST, PUT, PATCH requests, a JSON serializable dictionary for the request body. Example: {\"name\": \"new_entity\", \"status\": \"active\"}.",
+                    "description": "JSON payload for POST/PUT requests.",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
                 }
             },
             "required": ["method", "url"]
         }
     }
 }
+
 # Mapping of tool names to their functions
 available_tools_mapping = {
-    "call_rest_api": call_rest_api,
-    "call_mcp_server": call_mcp_server,
-}
+    "call_rest_api": call_rest_api, # Temporarily commented out
+} # This mapping is for non-MCP tools
 # Accept user input
 prompt_from_redo = st.session_state.pop("force_process_prompt", None)
 prompt_from_chat_input = st.chat_input("What is your question?")
@@ -908,190 +782,139 @@ if final_prompt_to_process:
             # Display of this user message will be handled by the main message display loop on st.rerun or at end of script
 
         langchain_conversation_messages: list[BaseMessage] = []
+        
+        def _augment_prompt_with_rag_if_possible(query_string: str) -> tuple[str, bool]:
+            """
+            Attempts to augment the given query_string with RAG context.
+            Returns the (potentially augmented) query string and a boolean indicating if RAG was active.
+            """
+            if st.session_state.retriever: # Check if retriever is available
+                with st.spinner("Retrieving relevant documents for RAG..."):
+                    retrieved_docs = st.session_state.retriever.invoke(query_string)
+                if retrieved_docs:
+                    context_str = "\n\n".join([doc.page_content for doc in retrieved_docs])
+                    augmented_content = (
+                        f"Please answer the following question based on the provided context.\n\n"
+                        f"Context:\n{context_str}\n\n"
+                        f"Question: {query_string}"
+                    )
+                    st.toast(f"ℹ️ Augmented prompt with context from {len(retrieved_docs)} document chunks.", icon="📄")
+                    return augmented_content, True # RAG was active
+                else: # Retriever exists, but no docs found for this query
+                    st.toast("ℹ️ No relevant documents found for RAG. Using original prompt.", icon="📄")
+                    return query_string, False # RAG was attempted but no context added
+            return query_string, False # No retriever, RAG not active
 
+        rag_active_for_this_prompt = False 
         # Add conversation history from the current active chat
         if current_hist_valid_for_prompt:
             history_messages_to_convert = st.session_state.histories[active_history_idx]["messages"]
             for i, msg_dict in enumerate(history_messages_to_convert):
                 is_last_message = (i == len(history_messages_to_convert) - 1)
                 current_message_content = msg_dict.get("content", "")
-
-                if msg_dict.get("role") == "user" and is_last_message and st.session_state.retriever:
+                if msg_dict.get("role") == "user" and is_last_message:
                     # This is the current user prompt, try to augment it for RAG
-                    with st.spinner("Retrieving relevant documents for RAG..."):
-                        retrieved_docs = st.session_state.retriever.invoke(current_message_content)
-                    
-                    if retrieved_docs:
-                        context_str = "\n\n".join([doc.page_content for doc in retrieved_docs])
-                        augmented_content = (
-                            f"Please answer the following question based on the provided context.\n\n"
-                            f"Context:\n{context_str}\n\n"
-                            f"Question: {current_message_content}"
-                        )
-                        langchain_conversation_messages.append(HumanMessage(content=augmented_content))
-                        st.toast(f"ℹ️ Augmented prompt with context from {len(retrieved_docs)} document chunks.", icon="📄")
-                    else:
-                        langchain_conversation_messages.append(HumanMessage(content=current_message_content))
-                        st.toast("ℹ️ No relevant documents found for RAG. Using original prompt.", icon="📄")
+                    augmented_content, rag_was_active_for_current_message = _augment_prompt_with_rag_if_possible(current_message_content)
+                    langchain_conversation_messages.append(HumanMessage(content=augmented_content))
+                    if rag_was_active_for_current_message:
+                        rag_active_for_this_prompt = True
                 else:
                     langchain_conversation_messages.append(convert_dict_to_langchain_message(msg_dict))
-        
         else:
             # If no valid/active history, send only the current prompt.
-            if st.session_state.retriever and final_prompt_to_process:
-                with st.spinner("Retrieving relevant documents for RAG..."):
-                    retrieved_docs = st.session_state.retriever.invoke(final_prompt_to_process)
-                if retrieved_docs:
-                    context_str = "\n\n".join([doc.page_content for doc in retrieved_docs])
-                    augmented_content = (
-                        f"Please answer the following question based on the provided context.\n\n"
-                        f"Context:\n{context_str}\n\n"
-                        f"Question: {final_prompt_to_process}"
-                    )
-                    langchain_conversation_messages.append(HumanMessage(content=augmented_content))
-                    st.toast(f"ℹ️ Augmented prompt with context from {len(retrieved_docs)} document chunks.", icon="📄")
-                else:
-                    langchain_conversation_messages.append(HumanMessage(content=final_prompt_to_process))
-                    st.toast("ℹ️ No relevant documents found for RAG. Using original prompt.", icon="📄")
-            else:
-                langchain_conversation_messages.append(HumanMessage(content=final_prompt_to_process))
-        try:
-            if not st.session_state.current_model:
-                st.error("Model name is currently empty. Please set a valid model name in the sidebar.")
-                st.stop() # Stop execution for this run if model name is missing
+            # Attempt RAG augmentation for the standalone prompt
+            augmented_content, rag_was_active_for_current_message = _augment_prompt_with_rag_if_possible(final_prompt_to_process)
+            langchain_conversation_messages.append(HumanMessage(content=augmented_content))
+            if rag_was_active_for_current_message:
+                rag_active_for_this_prompt = True
 
+        def _handle_direct_llm_call(current_lc_messages: list[BaseMessage], hist_valid: bool, current_active_hist_idx: int | None, is_rag_call: bool = False):
+            """Handles direct LLM invocation, including tool binding and tool call loop."""
             bound_llm = st.session_state.openai_client
-            # Conditionally add tools and tool_choice.
+            # Conditionally add non-MCP tools.
             if st.session_state.current_provider not in ["sambanova", "ollama"]:
-                if bound_llm: # Ensure client is not None
-                    tools_to_bind = [rest_api_tool_definition]
-                    # Add MCP tool if MCP servers are configured
-                    if st.session_state.mcp_servers:
-                        tools_to_bind.append(mcp_tool_definition)
-                    bound_llm = bound_llm.bind_tools(tools_to_bind)
+                if bound_llm:
+                    tools_to_bind = []
+                    if "call_rest_api" in available_tools_mapping: # Only bind non-MCP tools
+                        tools_to_bind.append(rest_api_tool_definition)
+                    
+                    if tools_to_bind: 
+                        bound_llm = bound_llm.bind_tools(tools_to_bind)
 
-            with st.spinner("Thinking..."):
+            spinner_text = "Thinking with RAG context..." if is_rag_call else "Thinking..."
+            with st.spinner(spinner_text):
                 if not bound_llm:
                     st.error("LLM client is not properly initialized.")
                     st.stop()
-                response_aimessage = bound_llm.invoke(langchain_conversation_messages)
+                response_aimessage = bound_llm.invoke(current_lc_messages)
             
             if not response_aimessage or (not response_aimessage.content and not response_aimessage.tool_calls):
-                error_message_ui = "LLM response was empty or did not contain content or tool calls. This might be an issue with the API provider or the selected model."
-                print(f"Error: {error_message_ui}") # Log to console
-                if response_aimessage:
-                    try:
-                        print(f"Raw LLM AIMessage object: {response_aimessage.model_dump_json(indent=2)}")
-                    except Exception as e:
-                        print(f"Could not serialize response_aimessage, printing as string: {str(response_aimessage)}. Error: {e}")
-                else:
-                    print("LLM: response_aimessage object was None.")
-
-                st.error(error_message_ui + " Check console logs for more details if a response object was received.")
-                if current_hist_valid_for_prompt:
-                    st.session_state.histories[active_history_idx]["messages"].append(
+                error_message_ui = "LLM response was empty or did not contain content or tool calls..."
+                st.error(error_message_ui)
+                if hist_valid and current_active_hist_idx is not None:
+                    st.session_state.histories[current_active_hist_idx]["messages"].append(
                         {"role": "assistant", "content": "[Error: LLM returned no valid response content or tool calls]"}
                     )
-                st.rerun()
-                st.stop() # Halt further processing in this block for this run
+                st.rerun(); st.stop()
 
             parsed_tool_calls = response_aimessage.tool_calls
 
             if parsed_tool_calls:
-                # Assistant wants to call a tool
-                if current_hist_valid_for_prompt:
-                    # Store assistant's intent to call tool(s)
-                    st.session_state.histories[active_history_idx]["messages"].append(
+                if hist_valid and current_active_hist_idx is not None:
+                    st.session_state.histories[current_active_hist_idx]["messages"].append(
                         convert_aimessage_to_storage_dict(response_aimessage)
                     )
-                
-                # Add assistant's AIMessage to the ongoing LangChain conversation
-                langchain_conversation_messages.append(response_aimessage)
+                current_lc_messages.append(response_aimessage)
 
-                for tool_call_data in parsed_tool_calls: # tool_call_data is a ToolCall dict
+                for tool_call_data in parsed_tool_calls:
                     function_name = tool_call_data["name"]
                     function_to_call = available_tools_mapping.get(function_name)
-                    
                     if function_to_call:
                         try:
-                            function_args = tool_call_data["args"] # Already a dict
-                            tool_output = function_to_call(**function_args)
-                        except Exception as e:
-                            tool_output = f"Error parsing arguments or calling tool {function_name}: {e}"
-                    else:
-                        tool_output = f"Error: Tool '{function_name}' not found."
-
-                    # Store tool message in history (dict format)
-                    tool_message_for_storage = {
-                        "role": "tool", 
-                        "tool_call_id": tool_call_data["id"], 
-                        "name": function_name, 
-                        "content": tool_output
-                    }
-                    if current_hist_valid_for_prompt:
-                        st.session_state.histories[active_history_idx]["messages"].append(tool_message_for_storage)
-                    
-                    # Add ToolMessage to LangChain conversation for the next LLM call
-                    langchain_conversation_messages.append(
-                        ToolMessage(content=tool_output, tool_call_id=tool_call_data["id"])
-                    )
-                
-                # Second call to LLM with tool responses
+                            if function_name == "call_rest_api": st.toast(f"Attempting to use tool: {function_name}", icon="🌐")
+                            function_args = tool_call_data["args"]; tool_output = function_to_call(**function_args)
+                        except Exception as e: tool_output = f"Error parsing arguments or calling tool {function_name}: {e}"
+                    else: tool_output = f"Error: Tool '{function_name}' not found in available_tools_mapping."
+                    tool_message_for_storage = {"role": "tool", "tool_call_id": tool_call_data["id"], "name": function_name, "content": tool_output}
+                    if hist_valid and current_active_hist_idx is not None: st.session_state.histories[current_active_hist_idx]["messages"].append(tool_message_for_storage)
+                    current_lc_messages.append(ToolMessage(content=tool_output, tool_call_id=tool_call_data["id"]))
                 with st.spinner("Processing tool results..."):
-                    if not bound_llm: # Should not happen if first call succeeded
-                        st.error("LLM client became uninitialized before second call.")
-                        st.stop()
-                    second_response_aimessage = bound_llm.invoke(langchain_conversation_messages)
-                
-                if current_hist_valid_for_prompt:
-                    st.session_state.histories[active_history_idx]["messages"].append(
-                        convert_aimessage_to_storage_dict(second_response_aimessage)
-                    )
-            else:
-                # No tool calls, direct response
-                if response_aimessage.content and current_hist_valid_for_prompt:
-                    st.session_state.histories[active_history_idx]["messages"].append(
-                        convert_aimessage_to_storage_dict(response_aimessage)
-                    )
+                    if not bound_llm: st.error("LLM client became uninitialized."); st.stop()
+                    second_response_aimessage = bound_llm.invoke(current_lc_messages)
+                if hist_valid and current_active_hist_idx is not None: st.session_state.histories[current_active_hist_idx]["messages"].append(convert_aimessage_to_storage_dict(second_response_aimessage))
+            else: # No tool calls
+                if response_aimessage.content and hist_valid and current_active_hist_idx is not None:
+                    st.session_state.histories[current_active_hist_idx]["messages"].append(convert_aimessage_to_storage_dict(response_aimessage))
+
+        try:
+            if not st.session_state.current_model:
+                    st.error("Please set a valid model name in the sidebar.")
+                    st.stop()
+            elif rag_active_for_this_prompt: # RAG was active, send directly to LLM
+                st.toast("Using LLM directly with RAG context.", icon="📄")
+                _handle_direct_llm_call(langchain_conversation_messages, current_hist_valid_for_prompt, active_history_idx, is_rag_call=True)
+            elif st.session_state.mcp_agent : # RAG not active, MCPAgent is active
+                with st.spinner("Agent is working..."):
+                    try:
+                        st.toast("Using Agent to process your request.", icon="🤖")
+                        # MCPAgent should receive the original prompt if RAG was not active
+                        agent_response_text = asyncio.run(st.session_state.mcp_agent.run(final_prompt_to_process)) 
+                        
+                        if current_hist_valid_for_prompt:
+                            st.session_state.histories[active_history_idx]["messages"].append(
+                                {"role": "assistant", "content": agent_response_text}
+                            )
+                    except Exception as e:
+                        st.error(f"Error during Agent execution: {e}")
+                        if current_hist_valid_for_prompt:
+                             st.session_state.histories[active_history_idx]["messages"].append(
+                                {"role": "assistant", "content": f"[Error during Agent execution: {e}]"}
+                            )
+            else: # RAG not active, MCPAgent not active -> Fallback to direct LLM
+                st.toast("Using LLM directly to process your request.", icon="🧠") # Adjusted icon for clarity
+                _handle_direct_llm_call(langchain_conversation_messages, current_hist_valid_for_prompt, active_history_idx, is_rag_call=False)
             
             # Rerun to display all new messages, including tool interactions
             st.rerun()
-
-        except openai.APIConnectionError as e:
-            st.error(f"API Connection Error: {e}. Please check your network and the Base URL.")
-            print(f"API Connection Error: {type(e).__name__}: {e}")
-        except openai.RateLimitError as e:
-            st.error(f"Rate Limit Exceeded: {e}")
-        except openai.AuthenticationError as e:
-            st.error(f"Authentication Error: {e}. Check your API key.")
-        except openai.APIStatusError as e:
-            error_detail = "No additional detail in response."
-            response_text_for_logging = "" # For console logging
-            if e.response is not None:
-                response_text_for_logging = e.response.text
-                try:
-                    # Try to parse as JSON for prettier display if it's structured error
-                    parsed_json_error = json.loads(e.response.text)
-                    error_detail = json.dumps(parsed_json_error, indent=2)
-                except json.JSONDecodeError:
-                    error_detail = e.response.text # Fallback to raw text
-            
-            print(f"API Status Error (code {e.status_code}). Raw response text: {response_text_for_logging}") # Log to console
-
-            st.error(f"API Status Error (code {e.status_code}):\nThe API provider returned an error. This can be due to various reasons such as malformed request data, an issue with the selected model, or API-specific limitations. See details below from the API response:\n```\n{error_detail}\n```")
-            
-            # Specific hint for Ollama 404, can be expanded for other common provider/status code issues
-            if st.session_state.current_provider == "ollama" and e.status_code == 404:
-                st.error(
-                    "For Ollama, a 404 error (Not Found) often means:\n"
-                    "1. The Ollama server is not running or not accessible at the configured Base URL (default: http://localhost:11434/v1).\n"
-                    "2. The specific model (e.g., '" + st.session_state.current_model + "') is not available/pulled in Ollama. Try: `ollama pull " + st.session_state.current_model + "` in your terminal.\n"
-                    "3. If using Docker for this Streamlit app and Ollama is on the host, ensure the app can reach the Ollama server (network config, e.g., use 'host.docker.internal' instead of 'localhost' in Base URL if applicable).\n"
-                    "4. The Ollama version might be outdated or its OpenAI-compatible endpoint `/v1/chat/completions` is not enabled/available."
-                )
-        except openai.APIError as e: # Catch other OpenAI API errors
-            st.error(f"OpenAI API Error: {e}")
-            print(f"OpenAI API Error: {type(e).__name__}: {e}")
         except Exception as e: # General fallback for non-OpenAI errors or unexpected issues
             st.error(f"An unexpected error occurred: {e}")
-            print(f"An unexpected error occurred: {type(e).__name__}: {e}")

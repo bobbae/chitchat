@@ -235,6 +235,30 @@ def process_loaded_history_data(loaded_data, source_name="file"):
     else:
         st.info(f"No new or updatable chat histories found in '{source_name}'.")
 
+# --- MCP Helper Functions ---
+def mcp_reader_thread(process, response_queue, server_name):
+    """Thread function to read responses from MCP server stdout."""
+    try:
+        for line in iter(process.stdout.readline, ''):
+            if line:
+                try:
+                    response = json.loads(line.strip())
+                    response_queue.put(response)
+                except json.JSONDecodeError:
+                    # Some MCP servers may output non-JSON lines (e.g., logs)
+                    pass
+    except Exception as e:
+        response_queue.put({"error": f"Reader thread error: {str(e)}"})
+
+def send_mcp_request(process, request):
+    """Send a JSON-RPC request to the MCP server via stdin."""
+    try:
+        request_str = json.dumps(request) + '\n'
+        process.stdin.write(request_str)
+        process.stdin.flush()
+    except Exception as e:
+        raise Exception(f"Failed to send request: {str(e)}")
+
 def process_documents_for_rag(uploaded_files):
     """Loads, splits, embeds, and indexes uploaded documents for RAG."""
     if not uploaded_files:
@@ -661,31 +685,6 @@ if st.session_state.current_history is not None and st.session_state.histories:
                                 else:
                                     # This case should ideally not be reached if button is only on user messages with content.
                                     st.toast("Could not find a user message to redo.", icon="⚠️")
-
-                
-# --- MCP Helper Functions ---
-def mcp_reader_thread(process, response_queue, server_name):
-    """Thread function to read responses from MCP server stdout."""
-    try:
-        for line in iter(process.stdout.readline, ''):
-            if line:
-                try:
-                    response = json.loads(line.strip())
-                    response_queue.put(response)
-                except json.JSONDecodeError:
-                    # Some MCP servers may output non-JSON lines (e.g., logs)
-                    pass
-    except Exception as e:
-        response_queue.put({"error": f"Reader thread error: {str(e)}"})
-
-def send_mcp_request(process, request):
-    """Send a JSON-RPC request to the MCP server via stdin."""
-    try:
-        request_str = json.dumps(request) + '\n'
-        process.stdin.write(request_str)
-        process.stdin.flush()
-    except Exception as e:
-        raise Exception(f"Failed to send request: {str(e)}")
 
 # --- Tool Definitions ---
 def call_mcp_server(server_name: str, method: str, params: dict = None) -> str:

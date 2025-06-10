@@ -94,7 +94,6 @@ def initialize_client(provider, model_name, api_key_input, base_url_input):
             openai_api_base=current_base_url,
             temperature=0.7 # You can set a default temperature or make it configurable
         )
-        st.sidebar.success(f"Client initialized for {provider} with model {model_name} at {current_base_url}")
         st.session_state.show_connection_toast = {"provider": provider, "model": model_name}
         return client
         # try_initialize_mcp_agent() # Called after client is set in the main logic
@@ -141,6 +140,10 @@ if "mcp_enabled_by_user" not in st.session_state: # User toggle for MCP
     st.session_state.mcp_enabled_by_user = False
 if "show_connection_toast" not in st.session_state: # For deferring connection toast
     st.session_state.show_connection_toast = None
+if "show_past_rag_usage_toast" not in st.session_state: # For past RAG usage notification
+    st.session_state.show_past_rag_usage_toast = False
+if "past_rag_documents_to_restore" not in st.session_state: # Store doc names for potential restore
+    st.session_state.past_rag_documents_to_restore = []
 
 _pending_idx = st.session_state.get("pending_history_activation_index") # For history activation
 
@@ -159,13 +162,24 @@ if _pending_idx is not None:
 # Display connection toast if a connection was just made
 if st.session_state.get("show_connection_toast"):
     toast_info = st.session_state.show_connection_toast
-    st.toast(f"Successfully connected to {toast_info['provider']} with model {toast_info['model']}!", icon="✅")
+    st.info(f"Successfully connected to {toast_info['provider']} with model {toast_info['model']}!", icon="✅")
     st.session_state.show_connection_toast = None # Clear the flag
+
+# Display past RAG usage toast if a history with past RAG was just activated
+if st.session_state.get("show_past_rag_usage_toast") and st.session_state.current_history is not None:
+    toast_message = "Note: This chat previously used RAG."
+    if st.session_state.past_rag_documents_to_restore:
+        toast_message += f" It referenced documents like: {', '.join(st.session_state.past_rag_documents_to_restore[:2])}{'...' if len(st.session_state.past_rag_documents_to_restore) > 2 else ''}."
+    toast_message += " To use RAG now, ensure documents are processed and RAG is enabled in the sidebar."
+    st.toast(toast_message, icon="💡")
+    st.session_state.show_past_rag_usage_toast = False # Clear the flag
+    # The actual prompt to restore will be in the sidebar after it's fully rendered.
 
 # Dynamically set the main page title based on connection status and current/target LLM
 provider_for_title = st.session_state.current_provider
 model_for_title = st.session_state.current_model
 st.title(f"Chat with {provider_for_title} {model_for_title}") # Always display the title
+
 
 def convert_dict_to_langchain_message(msg_dict: dict) -> BaseMessage:
     role = msg_dict.get("role")
@@ -263,6 +277,7 @@ def process_loaded_history_data(loaded_data, source_name="file"):
     
     if loaded_count > 0 or updated_count > 0:
         st.success(f"Successfully loaded {loaded_count} new and updated {updated_count} existing chat histories from '{source_name}'. They are now available in the 'Chat Histories' dropdown.")
+        st.caption("Chat histories loaded. Select a chat from the 'Available Chats' dropdown in the sidebar to activate it.")
         st.rerun()
     else:
         st.info(f"No new or updatable chat histories found in '{source_name}'.")
@@ -355,6 +370,22 @@ with st.sidebar:
             )
             try_initialize_mcp_agent() # Attempt to init agent after LLM is ready
 
+            # Check for past RAG usage in the newly activated history
+            st.session_state.show_past_rag_usage_toast = False # Reset before check
+            st.session_state.past_rag_documents_to_restore = [] # Reset
+            if isinstance(active_history_obj.get("messages"), list):
+                for msg_dict_check in active_history_obj["messages"]:
+                    if isinstance(msg_dict_check, dict) and \
+                       isinstance(msg_dict_check.get("metadata"), dict):
+                        rag_details = msg_dict_check["metadata"].get("rag_details")
+                        if isinstance(rag_details, str): # Try to parse if it's a JSON string (old format)
+                            try: rag_details = json.loads(rag_details)
+                            except json.JSONDecodeError: rag_details = None
+                        
+                        if isinstance(rag_details, dict) and rag_details.get("toggle_status") == "enabled" and rag_details.get("indexed_documents"):
+                            st.session_state.show_past_rag_usage_toast = True
+                            st.session_state.past_rag_documents_to_restore = list(set(st.session_state.past_rag_documents_to_restore + rag_details["indexed_documents"])) # Accumulate unique doc names
+                            # No break, accumulate all mentioned docs from the history
         else:
             st.error(f"Attempted to activate invalid history index: {new_active_idx}")
 
@@ -403,6 +434,22 @@ with st.sidebar:
                     if hist["provider"] == st.session_state.current_provider and \
                        hist["model"] == st.session_state.current_model:
                         existing_history_index = i
+                        # Check this existing_history for past RAG usage and set toast flag
+                        current_active_history_obj = st.session_state.histories[existing_history_index]
+                        st.session_state.show_past_rag_usage_toast = False # Reset before check
+                        st.session_state.past_rag_documents_to_restore = [] # Reset
+                        if isinstance(current_active_history_obj.get("messages"), list):
+                            for msg_dict_check in current_active_history_obj["messages"]:
+                                if isinstance(msg_dict_check, dict) and \
+                                   isinstance(msg_dict_check.get("metadata"), dict):
+                                    rag_details = msg_dict_check["metadata"].get("rag_details")
+                                    if isinstance(rag_details, str): # Try to parse if it's a JSON string
+                                        try: rag_details = json.loads(rag_details)
+                                        except json.JSONDecodeError: rag_details = None
+                                    
+                                    if isinstance(rag_details, dict) and rag_details.get("toggle_status") == "enabled" and rag_details.get("indexed_documents"):
+                                        st.session_state.show_past_rag_usage_toast = True
+                                        st.session_state.past_rag_documents_to_restore = list(set(st.session_state.past_rag_documents_to_restore + rag_details["indexed_documents"]))
                         break
                 
                 if existing_history_index != -1:
@@ -420,35 +467,12 @@ with st.sidebar:
                     st.session_state.histories.append(new_history)
                     st.session_state.current_history = len(st.session_state.histories) - 1
                     st.sidebar.success("New chat history created. Configuration applied successfully. Ready to chat!")
+                    st.session_state.past_rag_documents_to_restore = [] # New history won't have past RAG
+                    st.session_state.show_past_rag_usage_toast = False # New history won't have past RAG
                 st.rerun() # Rerun to update the main page title and reflect connection status
             else:
                  st.sidebar.error("LLM Client connection failed. Please check settings in sidebar and console.")
 
-
-    st.markdown("---")
-    st.subheader("Available Chats")
-    
-    # Chat selection dropdown
-    if st.session_state.histories:
-        history_names = [
-            f"{hist['provider']} - {hist['model']} ({len(hist['messages'])} messages)" 
-            for hist in st.session_state.histories
-        ]
-        # Use a more descriptive label for the selectbox itself
-        selected_hist = st.selectbox(
-            "Chats",
-            options=range(len(st.session_state.histories)),
-            format_func=lambda x: history_names[x],
-            index=st.session_state.current_history or 0
-        )
-        
-        if selected_hist != st.session_state.current_history:
-            # Set pending activation and rerun
-            st.session_state.pending_history_activation_index = selected_hist
-            # Client initialization and state updates will happen at the top of the sidebar in the next run
-            st.rerun()
-    else:
-        st.caption("No chats available. Start a new chat by applying a model configuration.")
 
     st.markdown("---")
     st.subheader("Chat History Management")
@@ -490,6 +514,29 @@ with st.sidebar:
         )
 
     st.markdown("---")
+    st.subheader("Available Chats")
+    
+    # Chat selection dropdown
+    if st.session_state.histories:
+        history_names = [ 
+            f"{hist['provider']} - {hist['model']} ({len(hist['messages'])} messages)" 
+            for hist in st.session_state.histories
+        ]
+        selected_hist = st.selectbox( 
+            "Choose a Chat History to Activate:", 
+            options=range(len(st.session_state.histories)),
+            format_func=lambda x: history_names[x],
+            index=st.session_state.current_history or 0 
+        )
+        
+        if selected_hist != st.session_state.current_history:
+            st.session_state.pending_history_activation_index = selected_hist
+            st.rerun()
+    else:
+        st.caption("No chats available. Start a new chat by applying a model configuration.")
+
+
+    st.markdown("---")
     st.subheader("RAG - Document Q&A")
     uploaded_files = st.file_uploader(
         "Upload documents (PDF, TXT) for RAG",
@@ -527,7 +574,12 @@ with st.sidebar:
             st.session_state.retriever = None
             st.session_state.processed_doc_names = []
             st.rerun()
-
+    # Display RAG restore prompt if applicable for the currently active chat
+    if st.session_state.current_history is not None and st.session_state.past_rag_documents_to_restore:
+        st.info(
+            f"Active chat previously used RAG with: **{', '.join(st.session_state.past_rag_documents_to_restore)}**. "
+            "To restore this RAG context, upload these documents above and click 'Process Uploaded Documents for RAG', then ensure 'Enable RAG' is on."
+        )
     st.markdown("---")
     st.subheader("MCP Client Configuration")
 
@@ -587,16 +639,18 @@ with st.sidebar:
         except Exception as e: # Catch errors from MCPClient.from_dict or get_tools
             st.error(f"Error during MCPClient initialization: {e}")
 
-    # Display configured MCP servers if client exists
+    if not st.session_state.openai_client:
+        st.error("LLM client is not initialized. Please configure and apply settings in the sidebar.")
+    
     if st.session_state.mcp_client:
         if st.session_state.mcp_config and "mcpServers" in st.session_state.mcp_config:
-            st.caption("Configured MCP Servers (status managed by MCPClient):")
+            st.info("Configured MCP Servers (status managed by MCPClient):")
             for server_name in st.session_state.mcp_config["mcpServers"].keys():
-                st.caption(f"  - {server_name}")
+                st.info(f"  - {server_name}")
     elif not st.session_state.mcp_enabled_by_user:
-         st.caption("MCP is currently DISABLED by toggle.")
+         st.info("MCP is currently DISABLED by toggle.")
     else:
-        st.caption("MCPClient/Agent is not active. Configure and apply above.")
+        st.info("MCPClient/Agent is not active. Configure and apply above.")
 
     if st.session_state.mcp_client or st.session_state.mcp_agent:
         if st.button("Stop MCP Client & Agent"):
@@ -686,7 +740,24 @@ if st.session_state.current_history is not None and st.session_state.histories:
                             if message_metadata.get("source"):
                                 meta_parts.append(f"Source: {message_metadata['source']}")
                             if message_metadata.get("rag_details"):
-                                meta_parts.append(f"RAG: {message_metadata['rag_details']}")
+                                rag_details_dict = message_metadata['rag_details']
+                                # Attempt to parse if it's a string (for backward compatibility or if saved as string)
+                                if isinstance(rag_details_dict, str):
+                                    try: rag_details_dict = json.loads(rag_details_dict)
+                                    except json.JSONDecodeError: rag_details_dict = {"raw_string": rag_details_dict} # Fallback
+                                if isinstance(rag_details_dict, dict): # Proceed if it's a dict
+                                    rag_status_parts = []
+                                    toggle_stat = rag_details_dict.get('toggle_status', 'Unknown')
+                                    rag_status_parts.append(f"RAG Toggle: {toggle_stat.capitalize()}")
+                                    if toggle_stat == "enabled":
+                                        context_stat = rag_details_dict.get('context_status', 'N/A')
+                                        rag_status_parts.append(f"Context: {context_stat.replace('_', ' ').title()}")
+                                        if rag_details_dict.get("indexed_documents"):
+                                            docs_str = ", ".join(rag_details_dict["indexed_documents"])
+                                            rag_status_parts.append(f"Indexed Docs: [{docs_str if docs_str else 'None'}]")
+                                        if "chunks_retrieved" in rag_details_dict:
+                                            rag_status_parts.append(f"Chunks: {rag_details_dict['chunks_retrieved']}")
+                                    meta_parts.append("RAG (" + " | ".join(rag_status_parts) + ")")
                             if message_metadata.get("processing_conflict_note"):
                                 meta_parts.append(f"Note: {message_metadata['processing_conflict_note'].replace('_', ' ').title()}")
                             if meta_parts:
@@ -839,7 +910,7 @@ if final_prompt_to_process:
 
         langchain_conversation_messages: list[BaseMessage] = []
         
-        def _augment_prompt_with_rag_if_possible(query_string: str) -> tuple[str, bool]:
+        def _augment_prompt_with_rag_if_possible(query_string: str) -> tuple[str, dict]:
             """
             Attempts to augment the given query_string with RAG context.
             Returns the (potentially augmented) query string and a boolean indicating if RAG was active.
@@ -847,6 +918,7 @@ if final_prompt_to_process:
             if st.session_state.rag_enabled_by_user and st.session_state.retriever: # Check toggle and retriever
                 with st.spinner("Retrieving relevant documents for RAG..."):
                     retrieved_docs = st.session_state.retriever.invoke(query_string)
+                rag_details_dict = {"toggle_status": "enabled", "context_status": "retriever_active"}
                 if retrieved_docs:
                     context_str = "\n\n".join([doc.page_content for doc in retrieved_docs])
                     augmented_content = (
@@ -854,15 +926,23 @@ if final_prompt_to_process:
                         f"Context:\n{context_str}\n\n"
                         f"Question: {query_string}"
                     )
-                    rag_toast_message = f"ℹ️ RAG: Used {len(retrieved_docs)} document chunks."
+                    # Use the list of all currently processed document names for rag_details
+                    rag_doc_names_for_metadata = list(st.session_state.processed_doc_names) # Make a copy
+                    rag_toast_message = f"ℹ️ RAG: Used {len(retrieved_docs)} chunks from indexed documents."
                     st.toast(rag_toast_message, icon="📄")
-                    # Store RAG details for the augmented message
-                    # This detail will be associated with the HumanMessage that gets the augmented_content
-                    return augmented_content, True # RAG was active
+                    rag_details_dict["context_status"] = "found"
+                    rag_details_dict["indexed_documents"] = rag_doc_names_for_metadata
+                    rag_details_dict["chunks_retrieved"] = len(retrieved_docs)
+                    return augmented_content, rag_details_dict
                 else: # Retriever exists, but no docs found for this query
                     st.toast("ℹ️ No relevant documents found for RAG. Using original prompt.", icon="📄")
-                    return query_string, False # RAG was attempted but no context added
-            return query_string, False # No retriever, RAG not active
+                    rag_details_dict["context_status"] = "not_found"
+                    rag_details_dict["indexed_documents"] = list(st.session_state.processed_doc_names) # Still show what was indexed
+                    rag_details_dict["chunks_retrieved"] = 0
+                    return query_string, rag_details_dict
+            elif st.session_state.rag_enabled_by_user and not st.session_state.retriever:
+                return query_string, {"toggle_status": "enabled", "context_status": "no_retriever"}
+            return query_string, {"toggle_status": "disabled"} # RAG toggle is off
 
         rag_active_for_this_prompt = False 
         # Add conversation history from the current active chat
@@ -873,29 +953,27 @@ if final_prompt_to_process:
                 current_message_content = msg_dict.get("content", "")
                 if msg_dict.get("role") == "user" and is_last_message:
                     # This is the current user prompt, try to augment it for RAG
-                    augmented_content, rag_was_active_for_current_message = _augment_prompt_with_rag_if_possible(current_message_content)
+                    augmented_content, rag_info_dict = _augment_prompt_with_rag_if_possible(current_message_content)
                     human_message_metadata = {"source": "user_input_processed"}
-                    if rag_was_active_for_current_message:
-                        human_message_metadata["rag_details"] = "Context augmented" 
-                        # In a more complex scenario, you might store actual doc IDs or chunk summaries here
+                    human_message_metadata["rag_details"] = rag_info_dict # Always add rag_info_dict
                     langchain_conversation_messages.append(
                         HumanMessage(content=augmented_content, metadata=human_message_metadata)
                     )
-                    if rag_was_active_for_current_message: # Set the overall flag
+                    # RAG is active for the prompt if the toggle was on and context was actually found
+                    if rag_info_dict.get("toggle_status") == "enabled" and rag_info_dict.get("context_status") == "found":
                         rag_active_for_this_prompt = True
                 else:
                     langchain_conversation_messages.append(convert_dict_to_langchain_message(msg_dict))
         else:
             # If no valid/active history, send only the current prompt.
             # Attempt RAG augmentation for the standalone prompt
-            augmented_content, rag_was_active_for_current_message = _augment_prompt_with_rag_if_possible(final_prompt_to_process)
+            augmented_content, rag_info_dict = _augment_prompt_with_rag_if_possible(final_prompt_to_process)
             human_message_metadata = {"source": "user_input_standalone"}
-            if rag_was_active_for_current_message:
-                human_message_metadata["rag_details"] = "Context augmented"
+            human_message_metadata["rag_details"] = rag_info_dict # Always add rag_info_dict
             langchain_conversation_messages.append(
                 HumanMessage(content=augmented_content, metadata=human_message_metadata)
             )
-            if rag_was_active_for_current_message: # Set the overall flag
+            if rag_info_dict.get("toggle_status") == "enabled" and rag_info_dict.get("context_status") == "found":
                 rag_active_for_this_prompt = True
 
         def _handle_direct_llm_call(
@@ -930,7 +1008,12 @@ if final_prompt_to_process:
                 st.error(error_message_ui)
                 if hist_valid and current_active_hist_idx is not None:
                     error_metadata = {"source": source_description, "error": "empty_response"}
-                    if is_rag_call: error_metadata["rag_details"] = "RAG context was used"
+                    # Try to get rag_details from the input HumanMessage if RAG was intended
+                    # The last message in current_lc_messages is the one that would have been augmented
+                    relevant_human_message_for_rag_details = current_lc_messages[-1] if current_lc_messages and isinstance(current_lc_messages[-1], HumanMessage) else None
+                    if is_rag_call and relevant_human_message_for_rag_details and \
+                       hasattr(relevant_human_message_for_rag_details, 'metadata') and relevant_human_message_for_rag_details.metadata.get('rag_details'):
+                        error_metadata["rag_details"] = current_lc_messages[0].metadata['rag_details']
                     st.session_state.histories[current_active_hist_idx]["messages"].append(
                         {
                             "role": "assistant", 
@@ -945,7 +1028,10 @@ if final_prompt_to_process:
             if parsed_tool_calls:
                 if hist_valid and current_active_hist_idx is not None:
                     ai_message_metadata = {"source": source_description, "tool_caller_type": "llm_direct"}
-                    if is_rag_call: ai_message_metadata["rag_details"] = "RAG context was used"
+                    relevant_human_message_for_rag_details = current_lc_messages[-2] if len(current_lc_messages) > 1 and isinstance(current_lc_messages[-2], HumanMessage) else None # -2 because AIMessage was just appended
+                    if is_rag_call and relevant_human_message_for_rag_details and \
+                       hasattr(relevant_human_message_for_rag_details, 'metadata') and relevant_human_message_for_rag_details.metadata.get('rag_details'):
+                         ai_message_metadata["rag_details"] = relevant_human_message_for_rag_details.metadata['rag_details']
                     response_aimessage.metadata = ai_message_metadata # Add metadata to AIMessage object
                     st.session_state.histories[current_active_hist_idx]["messages"].append(
                         convert_aimessage_to_storage_dict(response_aimessage) # This will now store metadata
@@ -975,13 +1061,19 @@ if final_prompt_to_process:
                     second_response_aimessage = bound_llm.invoke(current_lc_messages)
                 if hist_valid and current_active_hist_idx is not None:
                     second_ai_message_metadata = {"source": source_description, "after_tool_call": True}
-                    if is_rag_call: second_ai_message_metadata["rag_details"] = "RAG context was used (pre-tool)"
+                    # Find the original HumanMessage that might have RAG details
+                    original_human_message_for_rag = next((m for m in reversed(current_lc_messages) if isinstance(m, HumanMessage) and hasattr(m, 'metadata') and m.metadata.get('rag_details')), None)
+                    if is_rag_call and original_human_message_for_rag:
+                         second_ai_message_metadata["rag_details"] = original_human_message_for_rag.metadata['rag_details']
                     second_response_aimessage.metadata = second_ai_message_metadata
                     st.session_state.histories[current_active_hist_idx]["messages"].append(convert_aimessage_to_storage_dict(second_response_aimessage))
             else: # No tool calls
                 if response_aimessage.content and hist_valid and current_active_hist_idx is not None:
                     ai_message_metadata = {"source": source_description}
-                    if is_rag_call: ai_message_metadata["rag_details"] = "RAG context was used"
+                    relevant_human_message_for_rag_details = current_lc_messages[-1] if current_lc_messages and isinstance(current_lc_messages[-1], HumanMessage) else None
+                    if is_rag_call and relevant_human_message_for_rag_details and \
+                       hasattr(relevant_human_message_for_rag_details, 'metadata') and relevant_human_message_for_rag_details.metadata.get('rag_details'):
+                        ai_message_metadata["rag_details"] = relevant_human_message_for_rag_details.metadata['rag_details']
                     if is_rag_call and st.session_state.mcp_enabled_by_user: # Both RAG and MCP were enabled
                         ai_message_metadata["processing_conflict_note"] = "rag_mcp_conflict_rag_precedence"
                     response_aimessage.metadata = ai_message_metadata

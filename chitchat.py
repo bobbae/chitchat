@@ -1114,7 +1114,7 @@ if final_prompt_to_process:
                         # Explicitly close the client after use
                         if hasattr(fresh_client, 'close'):
                             if asyncio.iscoroutinefunction(fresh_client.close):
-                                await fresh_client.close()
+                                asyncio.run(fresh_client.close())
                             else:
                                 fresh_client.close()
                         

@@ -353,6 +353,7 @@ def process_documents_for_rag(uploaded_files):
         elif not processed_file_names_this_run: # No files were successfully processed to splits
             st.sidebar.info("No new document content was processed.")
 
+
 # Sidebar for LLM Configuration
 with st.sidebar:
     # Centralized logic to handle history activation before widgets are rendered

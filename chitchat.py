@@ -270,7 +270,8 @@ def process_loaded_history_data(loaded_data, source_name="file"):
             "messages": messages,
             "timestamp": hist_to_load.get("timestamp", datetime.datetime.now().isoformat()),
             "mcp_config_snapshot": hist_to_load.get("mcp_config_snapshot", {}), # Load MCP config
-            "mcp_enabled_snapshot": hist_to_load.get("mcp_enabled_snapshot", False) # Load MCP toggle state
+            "mcp_enabled_snapshot": hist_to_load.get("mcp_enabled_snapshot", False), # Load MCP toggle state
+            "mcp_config_input": hist_to_load.get("mcp_config_input", "")  # Preserve raw JSON input
         }
 
         if existing_history_index != -1:
@@ -376,8 +377,11 @@ with st.sidebar:
             )
             try_initialize_mcp_agent() # Attempt to init agent after LLM is ready
 
-            # Restore MCP settings from activated history
+            # Restore MCP settings and raw input from activated history
             st.session_state.mcp_config = active_history_obj.get("mcp_config_snapshot", {})
+            # Update the text area with the raw JSON input from history
+            if "mcp_config_input" in active_history_obj:
+                mcp_config_input_area = json.dumps(active_history_obj["mcp_config_input"], indent=2)
             st.session_state.mcp_enabled_by_user = active_history_obj.get("mcp_enabled_snapshot", False)
             if "mcp_config_snapshot" in active_history_obj or "mcp_enabled_snapshot" in active_history_obj:
                 st.session_state.show_mcp_restore_info = True
@@ -478,7 +482,7 @@ with st.sidebar:
                             "base_url": st.session_state.base_url, # Store the current base_url
                             "messages": [],
                             "timestamp": datetime.datetime.now().isoformat(),
-                            "mcp_config_snapshot": st.session_state.mcp_config, # Snapshot current MCP config
+                            "mcp_config_snapshot": json.loads(mcp_config_input_area),  # Store raw textarea content as config
                             "mcp_enabled_snapshot": st.session_state.mcp_enabled_by_user # Snapshot current MCP toggle
                         }
                         st.session_state.histories.append(new_history)

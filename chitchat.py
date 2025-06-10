@@ -1102,14 +1102,21 @@ if final_prompt_to_process:
                 with st.spinner("Agent is working..."):
                     try:
                         st.toast("Using Agent to process your request.", icon="🤖")
-                        # Create fresh agent instance for each request with current config
+                        # Create fresh client and agent instance for each request
+                        fresh_client = MCPClient.from_dict(st.session_state.mcp_config)
                         fresh_agent = MCPAgent(
                             llm=st.session_state.openai_client,
-                            client=st.session_state.mcp_client,
+                            client=fresh_client,
                             memory_enabled=False,
                             max_steps=10
                         )
-                        agent_response_text = asyncio.run(fresh_agent.run(final_prompt_to_process)) 
+                        agent_response_text = asyncio.run(fresh_agent.run(final_prompt_to_process))
+                        # Explicitly close the client after use
+                        if hasattr(fresh_client, 'close'):
+                            if asyncio.iscoroutinefunction(fresh_client.close):
+                                await fresh_client.close()
+                            else:
+                                fresh_client.close()
                         
                         if current_hist_valid_for_prompt:
                             st.session_state.histories[active_history_idx]["messages"].append(

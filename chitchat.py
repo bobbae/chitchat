@@ -482,7 +482,8 @@ with st.sidebar:
                             "base_url": st.session_state.base_url, # Store the current base_url
                             "messages": [],
                             "timestamp": datetime.datetime.now().isoformat(),
-                            "mcp_config_snapshot": json.loads(mcp_config_input_area),  # Store raw textarea content as config
+                            "mcp_config_snapshot": json.loads(mcp_config_input_area),  # Store parsed config
+                            "mcp_config_input": mcp_config_input_area,  # Store raw textarea content
                             "mcp_enabled_snapshot": st.session_state.mcp_enabled_by_user # Snapshot current MCP toggle
                         }
                         st.session_state.histories.append(new_history)

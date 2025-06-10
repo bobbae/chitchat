@@ -381,7 +381,7 @@ with st.sidebar:
             st.session_state.mcp_config = active_history_obj.get("mcp_config_snapshot", {})
             # Update the text area with the raw JSON input from history
             if "mcp_config_input" in active_history_obj:
-                mcp_config_input_area = json.dumps(active_history_obj["mcp_config_input"], indent=2)
+                st.session_state.mcp_config_input = json.dumps(active_history_obj["mcp_config_input"], indent=2)
             st.session_state.mcp_enabled_by_user = active_history_obj.get("mcp_enabled_snapshot", False)
             if "mcp_config_snapshot" in active_history_obj or "mcp_enabled_snapshot" in active_history_obj:
                 st.session_state.show_mcp_restore_info = True

@@ -4,6 +4,7 @@ import datetime
 import json
 import os
 from io import BytesIO
+import traceback # For detailed error logging
 import tempfile # For handling uploaded PDF files, used in process_documents_for_rag
 
 import openai # Import the openai library for its exception types
@@ -55,6 +56,7 @@ def try_initialize_mcp_agent():
             st.session_state.mcp_agent = MCPAgent(
                 llm=st.session_state.openai_client,
                 client=st.session_state.mcp_client,
+                memory_enabled=False,
                 max_steps=10  # Default max steps for the agent
             )
             # st.sidebar.info("MCPAgent initialized/updated.") # Can be noisy, enable if needed
@@ -96,7 +98,6 @@ def initialize_client(provider, model_name, api_key_input, base_url_input):
         )
         st.session_state.show_connection_toast = {"provider": provider, "model": model_name}
         return client
-        # try_initialize_mcp_agent() # Called after client is set in the main logic
     except Exception as e:
         st.sidebar.error(f"Failed to initialize client: {e}")
         return None
@@ -144,6 +145,8 @@ if "show_past_rag_usage_toast" not in st.session_state: # For past RAG usage not
     st.session_state.show_past_rag_usage_toast = False
 if "past_rag_documents_to_restore" not in st.session_state: # Store doc names for potential restore
     st.session_state.past_rag_documents_to_restore = []
+if "show_mcp_restore_info" not in st.session_state: # For MCP restore info
+    st.session_state.show_mcp_restore_info = False
 
 _pending_idx = st.session_state.get("pending_history_activation_index") # For history activation
 
@@ -265,7 +268,9 @@ def process_loaded_history_data(loaded_data, source_name="file"):
             "model": model,
             "base_url": hist_to_load.get("base_url", DEFAULT_PROVIDER_URLS.get(provider, "")),
             "messages": messages,
-            "timestamp": hist_to_load.get("timestamp", datetime.datetime.now().isoformat())
+            "timestamp": hist_to_load.get("timestamp", datetime.datetime.now().isoformat()),
+            "mcp_config_snapshot": hist_to_load.get("mcp_config_snapshot", {}), # Load MCP config
+            "mcp_enabled_snapshot": hist_to_load.get("mcp_enabled_snapshot", False) # Load MCP toggle state
         }
 
         if existing_history_index != -1:
@@ -370,6 +375,12 @@ with st.sidebar:
             )
             try_initialize_mcp_agent() # Attempt to init agent after LLM is ready
 
+            # Restore MCP settings from activated history
+            st.session_state.mcp_config = active_history_obj.get("mcp_config_snapshot", {})
+            st.session_state.mcp_enabled_by_user = active_history_obj.get("mcp_enabled_snapshot", False)
+            if "mcp_config_snapshot" in active_history_obj or "mcp_enabled_snapshot" in active_history_obj:
+                st.session_state.show_mcp_restore_info = True
+
             # Check for past RAG usage in the newly activated history
             st.session_state.show_past_rag_usage_toast = False # Reset before check
             st.session_state.past_rag_documents_to_restore = [] # Reset
@@ -391,284 +402,285 @@ with st.sidebar:
 
         st.session_state.pending_history_activation_index = None # Reset the trigger
 
-    st.header("Model Configuration")
-
-    selected_provider = st.selectbox(
-        "Select Provider:",
-        options=list(DEFAULT_PROVIDER_MODELS.keys()),
-        index=list(DEFAULT_PROVIDER_MODELS.keys()).index(st.session_state.current_provider)
-    )
-
-    # Update model and base_url defaults when provider changes
-    if selected_provider != st.session_state.current_provider:
-        st.session_state.current_provider = selected_provider
-        st.session_state.current_model = DEFAULT_PROVIDER_MODELS.get(selected_provider, "")
-        st.session_state.base_url = DEFAULT_PROVIDER_URLS.get(selected_provider, "")
-        # Clear client to force re-initialization
-        st.session_state.openai_client = None 
-
-    st.session_state.current_model = st.text_input("Model Name:", value=st.session_state.current_model)
-    
-    # The API key input is bound to st.session_state.api_key.
-    # It will start empty as st.session_state.api_key is initialized to "".
-    # If left empty by the user, initialize_client will try to use the ENV var.
-    st.text_input("API Key (optional, uses ENV if blank):", type="password", key="api_key")
-    
-    st.text_input("Base URL (optional, uses default if blank):", key="base_url")
-
-    if st.button("Apply Configuration & Connect"):
-        if not st.session_state.current_model:
-            st.sidebar.error("Model name cannot be empty.")
-        else:
-            st.session_state.openai_client = initialize_client(
-                st.session_state.current_provider,
-                st.session_state.current_model,
-                st.session_state.api_key,
-                st.session_state.base_url
-            )
-            try_initialize_mcp_agent() # Attempt to init agent after LLM is ready
-            if st.session_state.openai_client:
-                # Check if a history with the same provider and model already exists
-                existing_history_index = -1
-                for i, hist in enumerate(st.session_state.histories):
-                    if hist["provider"] == st.session_state.current_provider and \
-                       hist["model"] == st.session_state.current_model:
-                        existing_history_index = i
-                        # Check this existing_history for past RAG usage and set toast flag
-                        current_active_history_obj = st.session_state.histories[existing_history_index]
-                        st.session_state.show_past_rag_usage_toast = False # Reset before check
-                        st.session_state.past_rag_documents_to_restore = [] # Reset
-                        if isinstance(current_active_history_obj.get("messages"), list):
-                            for msg_dict_check in current_active_history_obj["messages"]:
-                                if isinstance(msg_dict_check, dict) and \
-                                   isinstance(msg_dict_check.get("metadata"), dict):
-                                    rag_details = msg_dict_check["metadata"].get("rag_details")
-                                    if isinstance(rag_details, str): # Try to parse if it's a JSON string
-                                        try: rag_details = json.loads(rag_details)
-                                        except json.JSONDecodeError: rag_details = None
-                                    
-                                    if isinstance(rag_details, dict) and rag_details.get("toggle_status") == "enabled" and rag_details.get("indexed_documents"):
-                                        st.session_state.show_past_rag_usage_toast = True
-                                        st.session_state.past_rag_documents_to_restore = list(set(st.session_state.past_rag_documents_to_restore + rag_details["indexed_documents"]))
-                        break
-                
-                if existing_history_index != -1:
-                    st.session_state.current_history = existing_history_index
-                    st.sidebar.info(f"Switched to existing chat history for {st.session_state.current_provider} - {st.session_state.current_model}.")
-                else:
-                    # Create new history entry
-                    new_history = {
-                        "provider": st.session_state.current_provider,
-                        "model": st.session_state.current_model,
-                        "base_url": st.session_state.base_url, # Store the current base_url
-                        "messages": [],
-                        "timestamp": datetime.datetime.now().isoformat()
-                    }
-                    st.session_state.histories.append(new_history)
-                    st.session_state.current_history = len(st.session_state.histories) - 1
-                    st.sidebar.success("New chat history created. Configuration applied successfully. Ready to chat!")
-                    st.session_state.past_rag_documents_to_restore = [] # New history won't have past RAG
-                    st.session_state.show_past_rag_usage_toast = False # New history won't have past RAG
-                st.rerun() # Rerun to update the main page title and reflect connection status
-            else:
-                 st.sidebar.error("LLM Client connection failed. Please check settings in sidebar and console.")
-
-
-    st.markdown("---")
-    st.subheader("Chat History Management")
-
-    # Button to clear the currently selected chat history
-    if st.button("Clear Selected Chat History", key="clear_selected_chat_history_sidebar_button"):
-        if st.session_state.current_history is not None and 0 <= st.session_state.current_history < len(st.session_state.histories):
-            st.session_state.histories[st.session_state.current_history]["messages"] = []
-        st.rerun()
-
-    # --- Load Histories Section ---
-    st.text_input(
-        "History JSON File Path:",
-        key="history_file_path", # Binds to st.session_state.history_file_path
-        help="Path to the chat histories JSON file (e.g., chat_histories.json)"
-    )
-
-    if st.button("Load Histories from Path"):
-        file_path = st.session_state.history_file_path
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            process_loaded_history_data(data, source_name=file_path) # Directly processes and reruns if successful
-        except FileNotFoundError:
-            st.error(f"History file '{file_path}' not found.")
-        except json.JSONDecodeError:
-            st.error(f"Error decoding JSON from '{file_path}'. Please ensure it's a valid JSON file.")
-        except Exception as e:
-            st.error(f"Error loading histories from '{file_path}': {e}")
-
-    # Save All History
-    if st.session_state.histories:
-        history_json = json.dumps(st.session_state.histories, indent=2, ensure_ascii=False)
-        st.download_button(
-            label="Save All History",
-            data=history_json,
-            file_name="chat_histories.json",
-            mime="application/json",
+    with st.sidebar.expander("Model Configuration", expanded=False):
+        selected_provider = st.selectbox(
+            "Select Provider:",
+            options=list(DEFAULT_PROVIDER_MODELS.keys()),
+            index=list(DEFAULT_PROVIDER_MODELS.keys()).index(st.session_state.current_provider)
         )
 
-    st.markdown("---")
-    st.subheader("Available Chats")
-    
-    # Chat selection dropdown
-    if st.session_state.histories:
-        history_names = [ 
-            f"{hist['provider']} - {hist['model']} ({len(hist['messages'])} messages)" 
-            for hist in st.session_state.histories
-        ]
-        selected_hist = st.selectbox( 
-            "Choose a Chat History to Activate:", 
-            options=range(len(st.session_state.histories)),
-            format_func=lambda x: history_names[x],
-            index=st.session_state.current_history or 0 
-        )
+        # Update model and base_url defaults when provider changes
+        if selected_provider != st.session_state.current_provider:
+            st.session_state.current_provider = selected_provider
+            st.session_state.current_model = DEFAULT_PROVIDER_MODELS.get(selected_provider, "")
+            st.session_state.base_url = DEFAULT_PROVIDER_URLS.get(selected_provider, "")
+            # Clear client to force re-initialization
+            st.session_state.openai_client = None 
+
+        st.session_state.current_model = st.text_input("Model Name:", value=st.session_state.current_model)
         
-        if selected_hist != st.session_state.current_history:
-            st.session_state.pending_history_activation_index = selected_hist
-            st.rerun()
-    else:
-        st.caption("No chats available. Start a new chat by applying a model configuration.")
+        # The API key input is bound to st.session_state.api_key.
+        # It will start empty as st.session_state.api_key is initialized to "".
+        # If left empty by the user, initialize_client will try to use the ENV var.
+        st.text_input("API Key (optional, uses ENV if blank):", type="password", key="api_key")
+        
+        st.text_input("Base URL (optional, uses default if blank):", key="base_url")
 
-
-    st.markdown("---")
-    st.subheader("RAG - Document Q&A")
-    uploaded_files = st.file_uploader(
-        "Upload documents (PDF, TXT) for RAG",
-        accept_multiple_files=True,
-        type=['pdf', 'txt'],
-        key="rag_file_uploader"
-    )
-    st.toggle("Enable RAG", key="rag_enabled_by_user", help="If enabled and documents are indexed, RAG context will be used with a direct LLM call.")
-
-    if st.session_state.rag_enabled_by_user and st.session_state.retriever:
-        st.info("RAG is ENABLED and documents are indexed.", icon="📄")
-    elif st.session_state.rag_enabled_by_user and not st.session_state.retriever:
-        st.warning("RAG is enabled by toggle, but no documents are indexed yet. Process documents to use RAG.", icon="⚠️")
-
-    # Add warning if both RAG and MCP are enabled by user
-    if st.session_state.rag_enabled_by_user and st.session_state.mcp_enabled_by_user:
-        st.warning("Both RAG and MCP are enabled. RAG will take precedence. To use MCPAgent, disable RAG.", icon="ℹ️")
-
-    if st.button("Process Uploaded Documents for RAG"):
-        process_documents_for_rag(uploaded_files)
-
-    if st.session_state.processed_doc_names:
-        st.write("Currently indexed documents for RAG:")
-        for i, name in enumerate(st.session_state.processed_doc_names):
-            col1, col2 = st.columns([0.8, 0.2])
-            with col1:
-                st.caption(f"- {name}")
-            with col2:
-                if st.button("❌", key=f"remove_rag_doc_{i}", help=f"Remove '{name}' from RAG list and clear RAG index."):
-                    st.session_state.processed_doc_names.pop(i)
-                    st.session_state.retriever = None # Clear the RAG index
-                    st.sidebar.info(f"Removed '{name}' from RAG list. The RAG index has been cleared. Please re-process documents if needed.")
-                    st.rerun()
-        if st.button("Clear All RAG Data (Index & Processed Documents)"):
-            st.session_state.retriever = None
-            st.session_state.processed_doc_names = []
-            st.rerun()
-    # Display RAG restore prompt if applicable for the currently active chat
-    if st.session_state.current_history is not None and st.session_state.past_rag_documents_to_restore:
-        st.info(
-            f"Active chat previously used RAG with: **{', '.join(st.session_state.past_rag_documents_to_restore)}**. "
-            "To restore this RAG context, upload these documents above and click 'Process Uploaded Documents for RAG', then ensure 'Enable RAG' is on."
-        )
-    st.markdown("---")
-    st.subheader("MCP Client Configuration")
-
-    # MCP config JSON input - mcp_config now stores the full {"mcpServers": ...} structure
-    mcp_config_input_val = json.dumps(st.session_state.mcp_config, indent=2) if st.session_state.mcp_config else \
-        json.dumps({
-            "mcpServers": {
-                "playwright": {
-                    "command": "npx",
-                    "args": ["@playwright/mcp@latest"],
-                    "env": {"DISPLAY": ":1"}
-                }
-            }
-        }, indent=2)
-
-    mcp_config_input_area = st.text_area(
-        "MCP Server Config (JSON for mcp-use):",
-        value=mcp_config_input_val,
-        height=200,
-        help="Enter MCP server configuration in JSON format, e.g., {\"mcpServers\": {\"server_name\": {\"command\": ...}}}. This will be used to initialize MCPClient from mcp-use."
-    )
-    st.toggle("Enable MCP Servers/Agent", key="mcp_enabled_by_user", help="If enabled and an MCP Agent is configured, it will be used for processing requests (unless RAG is active).")
-
-    if st.session_state.mcp_enabled_by_user and st.session_state.mcp_agent:
-        st.info("MCP is ENABLED and Agent is active.", icon="🤖")
-    elif st.session_state.mcp_enabled_by_user and not st.session_state.mcp_agent:
-        st.warning("MCP is enabled by toggle, but MCPAgent is not active (ensure LLM and MCPClient are configured).", icon="⚠️")
-
-
-    if st.button("Apply MCP Configuration & Initialize Client"):
-        try:
-            loaded_mcp_json = json.loads(mcp_config_input_area)
-            if not isinstance(loaded_mcp_json, dict) or "mcpServers" not in loaded_mcp_json:
-                st.error("MCP configuration must be a JSON object with a top-level 'mcpServers' key.")
+        if st.button("Apply Configuration & Connect"):
+            if not st.session_state.current_model:
+                st.sidebar.error("Model name cannot be empty.")
             else:
-                st.session_state.mcp_config = loaded_mcp_json # Store the full config
+                st.session_state.openai_client = initialize_client(
+                    st.session_state.current_provider,
+                    st.session_state.current_model,
+                    st.session_state.api_key,
+                    st.session_state.base_url
+                )
+                try_initialize_mcp_agent() # Attempt to init agent after LLM is ready
+                if st.session_state.openai_client:
+                    # Check if a history with the same provider and model already exists
+                    existing_history_index = -1
+                    for i, hist in enumerate(st.session_state.histories):
+                        if hist["provider"] == st.session_state.current_provider and \
+                        hist["model"] == st.session_state.current_model:
+                            existing_history_index = i
+                            # Check this existing_history for past RAG usage and set toast flag
+                            current_active_history_obj = st.session_state.histories[existing_history_index]
+                            st.session_state.show_past_rag_usage_toast = False # Reset before check
+                            # Restore MCP settings from this existing history
+                            st.session_state.mcp_config = current_active_history_obj.get("mcp_config_snapshot", {})
+                            st.session_state.mcp_enabled_by_user = current_active_history_obj.get("mcp_enabled_snapshot", False)
+                            if "mcp_config_snapshot" in current_active_history_obj or "mcp_enabled_snapshot" in current_active_history_obj:                             st.session_state.show_mcp_restore_info = True
+                            st.session_state.past_rag_documents_to_restore = [] # Reset
+                            if isinstance(current_active_history_obj.get("messages"), list):
+                                for msg_dict_check in current_active_history_obj["messages"]:
+                                    if isinstance(msg_dict_check, dict) and \
+                                    isinstance(msg_dict_check.get("metadata"), dict):
+                                        rag_details = msg_dict_check["metadata"].get("rag_details")
+                                        if isinstance(rag_details, str): # Try to parse if it's a JSON string
+                                            try: rag_details = json.loads(rag_details)
+                                            except json.JSONDecodeError: rag_details = None
+                                        
+                                        if isinstance(rag_details, dict) and rag_details.get("toggle_status") == "enabled" and rag_details.get("indexed_documents"):
+                                            st.session_state.show_past_rag_usage_toast = True
+                                            st.session_state.past_rag_documents_to_restore = list(set(st.session_state.past_rag_documents_to_restore + rag_details["indexed_documents"]))
+                            break
+                    
+                    if existing_history_index != -1:
+                        st.session_state.current_history = existing_history_index
+                        st.sidebar.info(f"Switched to existing chat history for {st.session_state.current_provider} - {st.session_state.current_model}.")
+                    else:
+                        # Create new history entry
+                        new_history = {
+                            "provider": st.session_state.current_provider,
+                            "model": st.session_state.current_model,
+                            "base_url": st.session_state.base_url, # Store the current base_url
+                            "messages": [],
+                            "timestamp": datetime.datetime.now().isoformat(),
+                            "mcp_config_snapshot": st.session_state.mcp_config, # Snapshot current MCP config
+                            "mcp_enabled_snapshot": st.session_state.mcp_enabled_by_user # Snapshot current MCP toggle
+                        }
+                        st.session_state.histories.append(new_history)
+                        st.session_state.current_history = len(st.session_state.histories) - 1
+                        st.sidebar.success("New chat history created. Configuration applied successfully. Ready to chat!")
+                        st.session_state.past_rag_documents_to_restore = [] # New history won't have past RAG
+                        st.session_state.show_past_rag_usage_toast = False # New history won't have past RAG
+                        st.session_state.show_mcp_restore_info = False # New history reflects current, no "restore" needed yet
+                    st.rerun() # Rerun to update the main page title and reflect connection status
+                else:
+                    st.sidebar.error("LLM Client connection failed. Please check settings in sidebar and console.")
 
-                # Attempt to close/stop the old client if it exists and has a close method
+    with st.sidebar.expander("Chat History Management", expanded=False):
+        # --- Load Histories Section ---
+        st.text_input(
+            "History JSON File Path:",
+            key="history_file_path", # Binds to st.session_state.history_file_path
+            help="Path to the chat histories JSON file (e.g., chat_histories.json)"
+        )
+
+        if st.button("Load Histories from Path"):
+            file_path = st.session_state.history_file_path
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                process_loaded_history_data(data, source_name=file_path) # Directly processes and reruns if successful
+            except FileNotFoundError:
+                st.error(f"History file '{file_path}' not found.")
+            except json.JSONDecodeError:
+                st.error(f"Error decoding JSON from '{file_path}'. Please ensure it's a valid JSON file.")
+            except Exception as e:
+                st.error(f"Error loading histories from '{file_path}': {e}")
+
+        # Save All History
+        if st.session_state.histories:
+            history_json = json.dumps(st.session_state.histories, indent=2, ensure_ascii=False)
+            st.download_button(
+                label="Save All History",
+                data=history_json,
+                file_name="chat_histories.json",
+                mime="application/json",
+            )
+    with st.sidebar.expander("Available Chats", expanded=False):
+        # Chat selection dropdown
+        if st.session_state.histories:
+            history_names = [ 
+                f"{hist['provider']} - {hist['model']} ({len(hist['messages'])} messages)" 
+                for hist in st.session_state.histories
+            ]
+            selected_hist = st.selectbox( 
+                "Choose a Chat History to Activate:", 
+                options=range(len(st.session_state.histories)),
+                format_func=lambda x: history_names[x],
+                index=st.session_state.current_history or 0 
+            )
+            
+            if selected_hist != st.session_state.current_history:
+                st.session_state.pending_history_activation_index = selected_hist
+                st.rerun()
+        else:
+            st.caption("No chats available. Start a new chat by applying a model configuration.")
+        
+        # Button to clear the currently selected chat history (moved here)
+        if st.session_state.current_history is not None and st.session_state.histories: # Only show if a history is active
+            if st.button("Clear Selected Chat History", key="clear_selected_chat_history_sidebar_button"):
+                if 0 <= st.session_state.current_history < len(st.session_state.histories):
+                    st.session_state.histories[st.session_state.current_history]["messages"] = []
+                st.rerun()
+
+    with st.sidebar.expander("RAG Configuration", expanded=False):
+        uploaded_files = st.file_uploader(
+            "Upload documents (PDF, TXT) for RAG",
+            accept_multiple_files=True,
+            type=['pdf', 'txt'],
+            key="rag_file_uploader"
+        )
+        st.toggle("Enable RAG", key="rag_enabled_by_user", help="If enabled and documents are indexed, RAG context will be used with a direct LLM call.")
+
+        if st.session_state.rag_enabled_by_user and st.session_state.retriever:
+            st.info("RAG is ENABLED and documents are indexed.", icon="📄")
+        elif st.session_state.rag_enabled_by_user and not st.session_state.retriever:
+            st.warning("RAG is enabled by toggle, but no documents are indexed yet. Process documents to use RAG.", icon="⚠️")
+
+        # Add warning if both RAG and MCP are enabled by user
+        if st.session_state.rag_enabled_by_user and st.session_state.mcp_enabled_by_user:
+            st.warning("Both RAG and MCP are enabled. RAG will take precedence. To use MCPAgent, disable RAG.", icon="ℹ️")
+
+        if st.button("Process Documents for RAG"):
+            process_documents_for_rag(uploaded_files)
+
+        if st.session_state.processed_doc_names:
+            st.write("Currently indexed documents for RAG:")
+            for i, name in enumerate(st.session_state.processed_doc_names):
+                col1, col2 = st.columns([0.8, 0.2])
+                with col1:
+                    st.caption(f"- {name}")
+                with col2:
+                    if st.button("❌", key=f"remove_rag_doc_{i}", help=f"Remove '{name}' from RAG list and clear RAG index."):
+                        st.session_state.processed_doc_names.pop(i)
+                        st.session_state.retriever = None # Clear the RAG index
+                        st.sidebar.info(f"Removed '{name}' from RAG list. The RAG index has been cleared. Please re-process documents if needed.")
+                        st.rerun()
+            if st.button("Clear All RAG Data (Index & Processed Documents)"):
+                st.session_state.retriever = None
+                st.session_state.processed_doc_names = []
+                st.rerun()
+        # Display RAG restore prompt if applicable for the currently active chat
+        if st.session_state.current_history is not None and st.session_state.past_rag_documents_to_restore:
+            st.info(
+                f"Active chat previously used RAG with: **{', '.join(st.session_state.past_rag_documents_to_restore)}**. "
+                "To restore this RAG context, upload these documents above and click 'Process Uploaded Documents for RAG', then ensure 'Enable RAG' is on."
+            )
+    with st.sidebar.expander("MCP Configuration", expanded=False):
+        # MCP config JSON input - mcp_config now stores the full {"mcpServers": ...} structure
+        mcp_config_input_val = json.dumps(st.session_state.mcp_config, indent=2) if st.session_state.mcp_config else \
+            json.dumps({
+                "mcpServers": {
+                    "playwright": {
+                        "command": "npx",
+                        "args": ["@playwright/mcp@latest"],
+                        "env": {"DISPLAY": ":1"}
+                    }
+                }
+            }, indent=2)
+
+        mcp_config_input_area = st.text_area(
+            "MCP Server Config JSON:",
+            value=mcp_config_input_val,
+            height=200,
+            help="Enter MCP server configuration in JSON format, e.g., {\"mcpServers\": {\"server_name\": {\"command\": ...}}}. This will be used to initialize MCPClient from mcp-use."
+        )
+        if st.session_state.show_mcp_restore_info:
+            st.info("MCP settings from the active chat history have been loaded into the controls above. Click 'Apply MCP Configuration' if you wish to use them.", icon="💡")
+            st.session_state.show_mcp_restore_info = False # Clear the flag
+
+        st.toggle("Enable MCP Servers/Agent", key="mcp_enabled_by_user", help="If enabled and an MCP Agent is configured, it will be used for processing requests (unless RAG is active).")
+
+        if st.session_state.mcp_enabled_by_user and st.session_state.mcp_agent:
+            st.info("MCP is ENABLED and Agent is active.", icon="🤖")
+        elif st.session_state.mcp_enabled_by_user and not st.session_state.mcp_agent:
+            st.warning("MCP is enabled by toggle, but MCPAgent is not active (ensure LLM and MCPClient are configured).", icon="⚠️")
+
+
+        if st.button("Apply MCP Configuration"):
+            try:
+                loaded_mcp_json = json.loads(mcp_config_input_area)
+                if not isinstance(loaded_mcp_json, dict) or "mcpServers" not in loaded_mcp_json:
+                    st.error("MCP configuration must be a JSON object with a top-level 'mcpServers' key.")
+                else:
+                    st.session_state.mcp_config = loaded_mcp_json # Store the full config
+
+                    # Attempt to close/stop the old client if it exists and has a close method
+                    if st.session_state.mcp_client and hasattr(st.session_state.mcp_client, 'close'):
+                        try:
+                            if asyncio.iscoroutinefunction(st.session_state.mcp_client.close):
+                                asyncio.run(st.session_state.mcp_client.close())
+                            else:
+                                st.session_state.mcp_client.close()
+                            st.info("Previous MCPClient resources released.")
+                        except Exception as e:
+                            st.warning(f"Error closing previous MCPClient: {e}")
+                    
+                    st.session_state.mcp_client = MCPClient.from_dict(st.session_state.mcp_config)
+                    num_servers = len(st.session_state.mcp_config.get("mcpServers", {}))
+                    st.success(f"MCPClient initialized with {num_servers} server definition(s).")
+                    try_initialize_mcp_agent() # Attempt to init agent after MCPClient is ready
+                    st.rerun()
+
+            except json.JSONDecodeError as e:
+                st.error(f"Invalid JSON for MCP config: {e}")
+            except Exception as e: # Catch errors from MCPClient.from_dict or get_tools
+                st.error(f"Error during MCPClient initialization: {e}")
+
+        if not st.session_state.openai_client:
+            st.error("LLM client is not initialized. Please configure and apply settings in the sidebar.")
+        
+        if st.session_state.mcp_client:
+            if st.session_state.mcp_config and "mcpServers" in st.session_state.mcp_config:
+                st.write("Configured MCP Servers (status managed by MCPClient):")
+                for server_name in st.session_state.mcp_config["mcpServers"].keys():
+                    st.write(f"  - {server_name}")
+        elif not st.session_state.mcp_enabled_by_user:
+            st.info("MCP is currently DISABLED by toggle.")
+        else:
+            st.info("MCPClient/Agent is not active. Configure and apply above.")
+
+        if st.session_state.mcp_client or st.session_state.mcp_agent:
+            if st.button("Stop MCP Client & Agent"):
                 if st.session_state.mcp_client and hasattr(st.session_state.mcp_client, 'close'):
                     try:
                         if asyncio.iscoroutinefunction(st.session_state.mcp_client.close):
                             asyncio.run(st.session_state.mcp_client.close())
                         else:
                             st.session_state.mcp_client.close()
-                        st.info("Previous MCPClient resources released.")
+                        st.info("MCPClient resources released.")
                     except Exception as e:
-                        st.warning(f"Error closing previous MCPClient: {e}")
+                        st.warning(f"Error closing MCPClient: {e}")
                 
-                st.session_state.mcp_client = MCPClient.from_dict(st.session_state.mcp_config)
-                num_servers = len(st.session_state.mcp_config.get("mcpServers", {}))
-                st.success(f"MCPClient initialized with {num_servers} server definition(s).")
-                try_initialize_mcp_agent() # Attempt to init agent after MCPClient is ready
+                st.session_state.mcp_client = None
+                st.session_state.mcp_agent = None
+                # Optionally clear mcp_config: st.session_state.mcp_config = {}
+                st.success("MCP Client and Agent have been stopped.")
                 st.rerun()
-
-        except json.JSONDecodeError as e:
-            st.error(f"Invalid JSON for MCP config: {e}")
-        except Exception as e: # Catch errors from MCPClient.from_dict or get_tools
-            st.error(f"Error during MCPClient initialization: {e}")
-
-    if not st.session_state.openai_client:
-        st.error("LLM client is not initialized. Please configure and apply settings in the sidebar.")
-    
-    if st.session_state.mcp_client:
-        if st.session_state.mcp_config and "mcpServers" in st.session_state.mcp_config:
-            st.info("Configured MCP Servers (status managed by MCPClient):")
-            for server_name in st.session_state.mcp_config["mcpServers"].keys():
-                st.info(f"  - {server_name}")
-    elif not st.session_state.mcp_enabled_by_user:
-         st.info("MCP is currently DISABLED by toggle.")
-    else:
-        st.info("MCPClient/Agent is not active. Configure and apply above.")
-
-    if st.session_state.mcp_client or st.session_state.mcp_agent:
-        if st.button("Stop MCP Client & Agent"):
-            if st.session_state.mcp_client and hasattr(st.session_state.mcp_client, 'close'):
-                try:
-                    if asyncio.iscoroutinefunction(st.session_state.mcp_client.close):
-                        asyncio.run(st.session_state.mcp_client.close())
-                    else:
-                        st.session_state.mcp_client.close()
-                    st.info("MCPClient resources released.")
-                except Exception as e:
-                    st.warning(f"Error closing MCPClient: {e}")
-            
-            st.session_state.mcp_client = None
-            st.session_state.mcp_agent = None
-            # Optionally clear mcp_config: st.session_state.mcp_config = {}
-            st.success("MCP Client and Agent have been stopped.")
-            st.rerun()
 
 # --- Main Chat Display Logic ---
 # Display chat messages from current history
@@ -1052,7 +1064,7 @@ if final_prompt_to_process:
                         "tool_call_id": tool_call_data["id"], 
                         "name": function_name, 
                         "content": tool_output,
-                        "metadata": {"tool_executor": "chitchat_direct_llm"}
+                        "metadata": {"tool_executor": "chitchat_manual_tool"}
                     }
                     if hist_valid and current_active_hist_idx is not None: st.session_state.histories[current_active_hist_idx]["messages"].append(tool_message_for_storage)
                     current_lc_messages.append(ToolMessage(content=tool_output, tool_call_id=tool_call_data["id"]))
@@ -1101,13 +1113,17 @@ if final_prompt_to_process:
                                     "metadata": {"source": "mcp_agent"}
                                 }
                             )
-                    except Exception as e:
-                        st.error(f"Error during Agent execution: {e}")
+                    except Exception as e: # Catch more general exceptions from MCPAgent
+                        detailed_error_msg = f"MCPAgent Error: {type(e).__name__} - {e}"
+                        st.error(detailed_error_msg)
+                        print("--- MCPAgent Execution Error Traceback ---")
+                        traceback.print_exc() # Print full traceback to console
+                        print("-----------------------------------------")
                         if current_hist_valid_for_prompt:
                              st.session_state.histories[active_history_idx]["messages"].append(
                                 {
                                     "role": "assistant", 
-                                    "content": f"[Error during Agent execution: {e}]",
+                                    "content": f"[Error during MCPAgent execution: {type(e).__name__} - {e}]",
                                     "metadata": {"source": "mcp_agent", "error": str(e)}
                                 }
                             )

@@ -1102,8 +1102,14 @@ if final_prompt_to_process:
                 with st.spinner("Agent is working..."):
                     try:
                         st.toast("Using Agent to process your request.", icon="🤖")
-                        # MCPAgent should receive the original prompt if RAG was not active
-                        agent_response_text = asyncio.run(st.session_state.mcp_agent.run(final_prompt_to_process)) 
+                        # Create fresh agent instance for each request with current config
+                        fresh_agent = MCPAgent(
+                            llm=st.session_state.openai_client,
+                            client=st.session_state.mcp_client,
+                            memory_enabled=False,
+                            max_steps=10
+                        )
+                        agent_response_text = asyncio.run(fresh_agent.run(final_prompt_to_process)) 
                         
                         if current_hist_valid_for_prompt:
                             st.session_state.histories[active_history_idx]["messages"].append(

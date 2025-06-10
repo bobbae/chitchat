@@ -41,7 +41,7 @@ PROVIDER_API_KEY_ENV_VARS = {
 DEFAULT_PROVIDER_MODELS = {
     "openai": "gpt-4o", 
     "ollama": "qwen3:8b", 
-    "openrouter": "meta-llama/llama-4-maverick:free",
+    "openrouter": "meta-llama/llama-4-maverick:free", 
     "sambanova": "DeepSeek-R1",
     "gemini": "gemini-1.5-flash",
     "anthropic": "claude-3-opus-20240229" # Example Anthropic model
@@ -147,6 +147,16 @@ if "past_rag_documents_to_restore" not in st.session_state: # Store doc names fo
     st.session_state.past_rag_documents_to_restore = []
 if "show_mcp_restore_info" not in st.session_state: # For MCP restore info
     st.session_state.show_mcp_restore_info = False
+if "mcp_config_input" not in st.session_state: # For MCP restore info
+    st.session_state.mcp_config_input = json.dumps({
+        "mcpServers": {
+            "playwright": {
+                "command": "npx",
+                "args": ["@playwright/mcp@latest"],
+                "env": {"DISPLAY": ":1"}
+            }
+        }
+    }, indent=2) # Default MCP config input
 
 _pending_idx = st.session_state.get("pending_history_activation_index") # For history activation
 
@@ -379,10 +389,18 @@ with st.sidebar:
 
             # Restore MCP settings and raw input from activated history
             st.session_state.mcp_config = active_history_obj.get("mcp_config_snapshot", {})
-            # Update the text area with the raw JSON input from history
-            if "mcp_config_input" in active_history_obj:
-                st.session_state.mcp_config_input = json.dumps(active_history_obj["mcp_config_input"], indent=2)
             st.session_state.mcp_enabled_by_user = active_history_obj.get("mcp_enabled_snapshot", False)
+
+            raw_mcp_input_from_history = active_history_obj.get("mcp_config_input")
+            default_mcp_config_text_area_content = json.dumps(
+                active_history_obj.get("mcp_config_snapshot", {}), # Use snapshot from this history
+                indent=2
+            )
+            if not raw_mcp_input_from_history: # Handles None or empty string
+                st.session_state.mcp_config_input = default_mcp_config_text_area_content
+            else:
+                st.session_state.mcp_config_input = raw_mcp_input_from_history
+
             if "mcp_config_snapshot" in active_history_obj or "mcp_enabled_snapshot" in active_history_obj:
                 st.session_state.show_mcp_restore_info = True
 
@@ -407,7 +425,7 @@ with st.sidebar:
 
         st.session_state.pending_history_activation_index = None # Reset the trigger
 
-    with st.sidebar.expander("Model Configuration", expanded=False):
+    with st.sidebar.expander("Model Configuration", expanded=True):
         selected_provider = st.selectbox(
             "Select Provider:",
             options=list(DEFAULT_PROVIDER_MODELS.keys()),
@@ -455,6 +473,17 @@ with st.sidebar:
                             # Restore MCP settings from this existing history
                             st.session_state.mcp_config = current_active_history_obj.get("mcp_config_snapshot", {})
                             st.session_state.mcp_enabled_by_user = current_active_history_obj.get("mcp_enabled_snapshot", False)
+
+                            raw_mcp_input_from_history = current_active_history_obj.get("mcp_config_input")
+                            default_mcp_config_text_area_content = json.dumps(
+                                current_active_history_obj.get("mcp_config_snapshot", {}),
+                                indent=2
+                            )
+                            if not raw_mcp_input_from_history: # Handles None or empty string
+                                st.session_state.mcp_config_input = default_mcp_config_text_area_content
+                            else:
+                                st.session_state.mcp_config_input = raw_mcp_input_from_history
+
                             if "mcp_config_snapshot" in current_active_history_obj or "mcp_enabled_snapshot" in current_active_history_obj:                             st.session_state.show_mcp_restore_info = True
                             st.session_state.past_rag_documents_to_restore = [] # Reset
                             if isinstance(current_active_history_obj.get("messages"), list):
@@ -475,6 +504,15 @@ with st.sidebar:
                         st.session_state.current_history = existing_history_index
                         st.sidebar.info(f"Switched to existing chat history for {st.session_state.current_provider} - {st.session_state.current_model}.")
                     else:
+                        # When creating a new history, snapshot the current MCP config from the text area
+                        current_mcp_config_for_snapshot = {}
+                        try:
+                            current_mcp_config_for_snapshot = json.loads(st.session_state.mcp_config_input)
+                            if not isinstance(current_mcp_config_for_snapshot, dict) or "mcpServers" not in current_mcp_config_for_snapshot:
+                                current_mcp_config_for_snapshot = {} # Invalid structure, snapshot empty
+                        except json.JSONDecodeError:
+                            current_mcp_config_for_snapshot = {} # Invalid JSON, snapshot empty
+                        
                         # Create new history entry
                         new_history = {
                             "provider": st.session_state.current_provider,
@@ -482,9 +520,9 @@ with st.sidebar:
                             "base_url": st.session_state.base_url, # Store the current base_url
                             "messages": [],
                             "timestamp": datetime.datetime.now().isoformat(),
-                            "mcp_config_snapshot": json.loads(st.session_state.mcp_config_input),  # Store parsed config
-                            "mcp_config_input": st.session_state.mcp_config_input,  # Store raw textarea content
-                            "mcp_enabled_snapshot": st.session_state.mcp_enabled_by_user # Snapshot current MCP toggle
+                            "mcp_config_snapshot": current_mcp_config_for_snapshot, 
+                            "mcp_enabled_snapshot": st.session_state.mcp_enabled_by_user, # Snapshot current MCP toggle
+                            "mcp_config_input": st.session_state.mcp_config_input # Save the raw input string from text area
                         }
                         st.session_state.histories.append(new_history)
                         st.session_state.current_history = len(st.session_state.histories) - 1
@@ -496,7 +534,7 @@ with st.sidebar:
                 else:
                     st.sidebar.error("LLM Client connection failed. Please check settings in sidebar and console.")
 
-    with st.sidebar.expander("Chat History Management", expanded=False):
+    with st.sidebar.expander("Chat History Management", expanded=True):
         # --- Load Histories Section ---
         st.text_input(
             "History JSON File Path:",
@@ -519,14 +557,33 @@ with st.sidebar:
 
         # Save All History
         if st.session_state.histories:
-            history_json = json.dumps(st.session_state.histories, indent=2, ensure_ascii=False)
+            # Before saving, update each history entry with the current MCP config from the text area and toggle state
+            current_mcp_config_from_textarea = {}
+            try:
+                current_mcp_config_from_textarea = json.loads(st.session_state.mcp_config_input)
+                if not isinstance(current_mcp_config_from_textarea, dict) or "mcpServers" not in current_mcp_config_from_textarea:
+                    # If structure is invalid, use the last successfully applied st.session_state.mcp_config or empty
+                    current_mcp_config_from_textarea = st.session_state.mcp_config if isinstance(st.session_state.mcp_config, dict) and "mcpServers" in st.session_state.mcp_config else {"mcpServers": {}}
+            except json.JSONDecodeError:
+                 # If JSON is invalid, use the last successfully applied st.session_state.mcp_config or empty
+                current_mcp_config_from_textarea = st.session_state.mcp_config if isinstance(st.session_state.mcp_config, dict) and "mcpServers" in st.session_state.mcp_config else {"mcpServers": {}}
+            
+            histories_to_save = []
+            for hist_entry in st.session_state.histories:
+                updated_hist_entry = hist_entry.copy()
+                updated_hist_entry["mcp_config_snapshot"] = current_mcp_config_from_textarea
+                updated_hist_entry["mcp_enabled_snapshot"] = st.session_state.mcp_enabled_by_user
+                updated_hist_entry["mcp_config_input"] = st.session_state.mcp_config_input # Save current text area content
+                histories_to_save.append(updated_hist_entry)
+            history_json = json.dumps(histories_to_save, indent=2, ensure_ascii=False)
+
             st.download_button(
                 label="Save All History",
                 data=history_json,
                 file_name="chat_histories.json",
                 mime="application/json",
             )
-    with st.sidebar.expander("Available Chats", expanded=False):
+    with st.sidebar.expander("Available Chats", expanded=True):
         # Chat selection dropdown
         if st.session_state.histories:
             history_names = [ 
@@ -553,7 +610,7 @@ with st.sidebar:
                     st.session_state.histories[st.session_state.current_history]["messages"] = []
                 st.rerun()
 
-    with st.sidebar.expander("RAG Configuration", expanded=False):
+    with st.sidebar.expander("RAG Configuration", expanded=True):
         uploaded_files = st.file_uploader(
             "Upload documents (PDF, TXT) for RAG",
             accept_multiple_files=True,
@@ -596,22 +653,15 @@ with st.sidebar:
                 f"Active chat previously used RAG with: **{', '.join(st.session_state.past_rag_documents_to_restore)}**. "
                 "To restore this RAG context, upload these documents above and click 'Process Uploaded Documents for RAG', then ensure 'Enable RAG' is on."
             )
-    with st.sidebar.expander("MCP Configuration", expanded=False):
-        # MCP config JSON input - mcp_config now stores the full {"mcpServers": ...} structure
-        mcp_config_input_val = json.dumps(st.session_state.mcp_config, indent=2) if st.session_state.mcp_config else \
-            json.dumps({
-                "mcpServers": {
-                    "playwright": {
-                        "command": "npx",
-                        "args": ["@playwright/mcp@latest"],
-                        "env": {"DISPLAY": ":1"}
-                    }
-                }
-            }, indent=2)
+    with st.sidebar.expander("MCP Configuration", expanded=True):
+ # Ensure mcp_config_input is valid JSON before rendering
+        try:
+            json.loads(st.session_state.mcp_config_input)
+        except json.JSONDecodeError: # If invalid, reset to a default empty structure (or the playwright example)
+            st.session_state.mcp_config_input = json.dumps({"mcpServers": {"playwright": {"command": "npx", "args": ["@playwright/mcp@latest"], "env": {"DISPLAY": ":1"}}}}, indent=2)
 
-        mcp_config_input_area = st.text_area(
+        st.text_area(       
             "MCP Server Config JSON:",
-            value=mcp_config_input_val,
             height=200,
             help="Enter MCP server configuration in JSON format, e.g., {\"mcpServers\": {\"server_name\": {\"command\": ...}}}. This will be used to initialize MCPClient from mcp-use.",
             key="mcp_config_input"
@@ -630,7 +680,8 @@ with st.sidebar:
 
         if st.button("Apply MCP Configuration"):
             try:
-                loaded_mcp_json = json.loads(mcp_config_input_area)
+                loaded_mcp_json = json.loads(st.session_state.mcp_config_input) # Read from session state
+
                 if not isinstance(loaded_mcp_json, dict) or "mcpServers" not in loaded_mcp_json:
                     st.error("MCP configuration must be a JSON object with a top-level 'mcpServers' key.")
                 else:

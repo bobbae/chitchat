@@ -482,8 +482,8 @@ with st.sidebar:
                             "base_url": st.session_state.base_url, # Store the current base_url
                             "messages": [],
                             "timestamp": datetime.datetime.now().isoformat(),
-                            "mcp_config_snapshot": json.loads(mcp_config_input_area),  # Store parsed config
-                            "mcp_config_input": mcp_config_input_area,  # Store raw textarea content
+                            "mcp_config_snapshot": json.loads(st.session_state.mcp_config_input),  # Store parsed config
+                            "mcp_config_input": st.session_state.mcp_config_input,  # Store raw textarea content
                             "mcp_enabled_snapshot": st.session_state.mcp_enabled_by_user # Snapshot current MCP toggle
                         }
                         st.session_state.histories.append(new_history)
@@ -613,7 +613,8 @@ with st.sidebar:
             "MCP Server Config JSON:",
             value=mcp_config_input_val,
             height=200,
-            help="Enter MCP server configuration in JSON format, e.g., {\"mcpServers\": {\"server_name\": {\"command\": ...}}}. This will be used to initialize MCPClient from mcp-use."
+            help="Enter MCP server configuration in JSON format, e.g., {\"mcpServers\": {\"server_name\": {\"command\": ...}}}. This will be used to initialize MCPClient from mcp-use.",
+            key="mcp_config_input"
         )
         if st.session_state.show_mcp_restore_info:
             st.info("MCP settings from the active chat history have been loaded into the controls above. Click 'Apply MCP Configuration' if you wish to use them.", icon="💡")

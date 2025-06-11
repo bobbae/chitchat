@@ -426,7 +426,84 @@ with st.sidebar:
 
         st.session_state.pending_history_activation_index = None # Reset the trigger
 
-    with st.sidebar.expander("MODEL", expanded=True):
+    with st.sidebar.expander("CHATS", expanded=True):
+        st.write("### Available Chats")
+        # Chat selection dropdown
+        if st.session_state.histories:
+            history_names = [ 
+                f"{hist['provider']} - {hist['model']} ({len(hist['messages'])} messages)" 
+                for hist in st.session_state.histories
+            ]
+            selected_hist = st.selectbox( 
+                "Choose a Chat History to Activate:", 
+                options=range(len(st.session_state.histories)),
+                format_func=lambda x: history_names[x],
+                index=st.session_state.current_history or 0 
+            )
+            
+            if selected_hist != st.session_state.current_history:
+                st.session_state.pending_history_activation_index = selected_hist
+                st.rerun()
+        else:
+            st.caption("No chats available. Start a new chat by applying a model configuration.")
+        
+        # Button to clear the currently selected chat history (moved here)
+        if st.session_state.current_history is not None and st.session_state.histories: # Only show if a history is active
+            if st.button("Clear Selected Chat History", key="clear_selected_chat_history_sidebar_button"):
+                if 0 <= st.session_state.current_history < len(st.session_state.histories):
+                    st.session_state.histories[st.session_state.current_history]["messages"] = []
+                st.rerun()
+
+        st.write("### Chat Histories")
+        st.text_input(
+            "History JSON File Path:",
+            key="history_file_path", # Binds to st.session_state.history_file_path
+            help="Path to the chat histories JSON file (e.g., chat_histories.json)"
+        )
+
+        if st.button("Load Histories from Path"):
+            file_path = st.session_state.history_file_path
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                process_loaded_history_data(data, source_name=file_path) # Directly processes and reruns if successful
+            except FileNotFoundError:
+                st.error(f"History file '{file_path}' not found.")
+            except json.JSONDecodeError:
+                st.error(f"Error decoding JSON from '{file_path}'. Please ensure it's a valid JSON file.")
+            except Exception as e:
+                st.error(f"Error loading histories from '{file_path}': {e}")
+
+        # Save All History
+        if st.session_state.histories:
+            # Before saving, update each history entry with the current MCP config from the text area and toggle state
+            current_mcp_config_from_textarea = {}
+            try:
+                current_mcp_config_from_textarea = json.loads(st.session_state.mcp_config_input)
+                if not isinstance(current_mcp_config_from_textarea, dict) or "mcpServers" not in current_mcp_config_from_textarea:
+                    # If structure is invalid, use the last successfully applied st.session_state.mcp_config or empty
+                    current_mcp_config_from_textarea = st.session_state.mcp_config if isinstance(st.session_state.mcp_config, dict) and "mcpServers" in st.session_state.mcp_config else {"mcpServers": {}}
+            except json.JSONDecodeError:
+                 # If JSON is invalid, use the last successfully applied st.session_state.mcp_config or empty
+                current_mcp_config_from_textarea = st.session_state.mcp_config if isinstance(st.session_state.mcp_config, dict) and "mcpServers" in st.session_state.mcp_config else {"mcpServers": {}}
+            
+            histories_to_save = []
+            for hist_entry in st.session_state.histories:
+                updated_hist_entry = hist_entry.copy()
+                updated_hist_entry["mcp_config_snapshot"] = current_mcp_config_from_textarea
+                updated_hist_entry["mcp_enabled_snapshot"] = st.session_state.mcp_enabled_by_user
+                updated_hist_entry["mcp_config_input"] = st.session_state.mcp_config_input # Save current text area content
+                histories_to_save.append(updated_hist_entry)
+            history_json = json.dumps(histories_to_save, indent=2, ensure_ascii=False)
+
+            st.download_button(
+                label="Save All History",
+                data=history_json,
+                file_name="chat_histories.json",
+                mime="application/json",
+            )
+
+        st.write("### New Chat Configuration")
         selected_provider = st.selectbox(
             "Select Provider:",
             options=list(DEFAULT_PROVIDER_MODELS.keys()),
@@ -535,81 +612,7 @@ with st.sidebar:
                 else:
                     st.sidebar.error("LLM Client connection failed. Please check settings in sidebar and console.")
 
-    with st.sidebar.expander("HISTORY", expanded=True):
-        # --- Load Histories Section ---
-        st.text_input(
-            "History JSON File Path:",
-            key="history_file_path", # Binds to st.session_state.history_file_path
-            help="Path to the chat histories JSON file (e.g., chat_histories.json)"
-        )
 
-        if st.button("Load Histories from Path"):
-            file_path = st.session_state.history_file_path
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                process_loaded_history_data(data, source_name=file_path) # Directly processes and reruns if successful
-            except FileNotFoundError:
-                st.error(f"History file '{file_path}' not found.")
-            except json.JSONDecodeError:
-                st.error(f"Error decoding JSON from '{file_path}'. Please ensure it's a valid JSON file.")
-            except Exception as e:
-                st.error(f"Error loading histories from '{file_path}': {e}")
-
-        # Save All History
-        if st.session_state.histories:
-            # Before saving, update each history entry with the current MCP config from the text area and toggle state
-            current_mcp_config_from_textarea = {}
-            try:
-                current_mcp_config_from_textarea = json.loads(st.session_state.mcp_config_input)
-                if not isinstance(current_mcp_config_from_textarea, dict) or "mcpServers" not in current_mcp_config_from_textarea:
-                    # If structure is invalid, use the last successfully applied st.session_state.mcp_config or empty
-                    current_mcp_config_from_textarea = st.session_state.mcp_config if isinstance(st.session_state.mcp_config, dict) and "mcpServers" in st.session_state.mcp_config else {"mcpServers": {}}
-            except json.JSONDecodeError:
-                 # If JSON is invalid, use the last successfully applied st.session_state.mcp_config or empty
-                current_mcp_config_from_textarea = st.session_state.mcp_config if isinstance(st.session_state.mcp_config, dict) and "mcpServers" in st.session_state.mcp_config else {"mcpServers": {}}
-            
-            histories_to_save = []
-            for hist_entry in st.session_state.histories:
-                updated_hist_entry = hist_entry.copy()
-                updated_hist_entry["mcp_config_snapshot"] = current_mcp_config_from_textarea
-                updated_hist_entry["mcp_enabled_snapshot"] = st.session_state.mcp_enabled_by_user
-                updated_hist_entry["mcp_config_input"] = st.session_state.mcp_config_input # Save current text area content
-                histories_to_save.append(updated_hist_entry)
-            history_json = json.dumps(histories_to_save, indent=2, ensure_ascii=False)
-
-            st.download_button(
-                label="Save All History",
-                data=history_json,
-                file_name="chat_histories.json",
-                mime="application/json",
-            )
-    with st.sidebar.expander("CHATS", expanded=True):
-        # Chat selection dropdown
-        if st.session_state.histories:
-            history_names = [ 
-                f"{hist['provider']} - {hist['model']} ({len(hist['messages'])} messages)" 
-                for hist in st.session_state.histories
-            ]
-            selected_hist = st.selectbox( 
-                "Choose a Chat History to Activate:", 
-                options=range(len(st.session_state.histories)),
-                format_func=lambda x: history_names[x],
-                index=st.session_state.current_history or 0 
-            )
-            
-            if selected_hist != st.session_state.current_history:
-                st.session_state.pending_history_activation_index = selected_hist
-                st.rerun()
-        else:
-            st.caption("No chats available. Start a new chat by applying a model configuration.")
-        
-        # Button to clear the currently selected chat history (moved here)
-        if st.session_state.current_history is not None and st.session_state.histories: # Only show if a history is active
-            if st.button("Clear Selected Chat History", key="clear_selected_chat_history_sidebar_button"):
-                if 0 <= st.session_state.current_history < len(st.session_state.histories):
-                    st.session_state.histories[st.session_state.current_history]["messages"] = []
-                st.rerun()
 
     with st.sidebar.expander("RAG", expanded=True):
         uploaded_files = st.file_uploader(

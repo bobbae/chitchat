@@ -10,6 +10,7 @@ import tempfile # For handling uploaded PDF files, used in process_documents_for
 import openai # Import the openai library for its exception types
 import requests 
 import streamlit as st
+from streamlit.components.v1 import html
 
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_community.vectorstores import FAISS
@@ -425,7 +426,7 @@ with st.sidebar:
 
         st.session_state.pending_history_activation_index = None # Reset the trigger
 
-    with st.sidebar.expander("Model Configuration", expanded=True):
+    with st.sidebar.expander("MODEL", expanded=True):
         selected_provider = st.selectbox(
             "Select Provider:",
             options=list(DEFAULT_PROVIDER_MODELS.keys()),
@@ -534,7 +535,7 @@ with st.sidebar:
                 else:
                     st.sidebar.error("LLM Client connection failed. Please check settings in sidebar and console.")
 
-    with st.sidebar.expander("Chat History Management", expanded=True):
+    with st.sidebar.expander("HISTORY", expanded=True):
         # --- Load Histories Section ---
         st.text_input(
             "History JSON File Path:",
@@ -583,7 +584,7 @@ with st.sidebar:
                 file_name="chat_histories.json",
                 mime="application/json",
             )
-    with st.sidebar.expander("Available Chats", expanded=True):
+    with st.sidebar.expander("CHATS", expanded=True):
         # Chat selection dropdown
         if st.session_state.histories:
             history_names = [ 
@@ -610,7 +611,7 @@ with st.sidebar:
                     st.session_state.histories[st.session_state.current_history]["messages"] = []
                 st.rerun()
 
-    with st.sidebar.expander("RAG Configuration", expanded=True):
+    with st.sidebar.expander("RAG", expanded=True):
         uploaded_files = st.file_uploader(
             "Upload documents (PDF, TXT) for RAG",
             accept_multiple_files=True,
@@ -653,7 +654,7 @@ with st.sidebar:
                 f"Active chat previously used RAG with: **{', '.join(st.session_state.past_rag_documents_to_restore)}**. "
                 "To restore this RAG context, upload these documents above and click 'Process Uploaded Documents for RAG', then ensure 'Enable RAG' is on."
             )
-    with st.sidebar.expander("MCP Configuration", expanded=True):
+    with st.sidebar.expander("MCP", expanded=True):
  # Ensure mcp_config_input is valid JSON before rendering
         try:
             json.loads(st.session_state.mcp_config_input)

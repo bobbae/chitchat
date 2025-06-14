@@ -1083,13 +1083,13 @@ if final_prompt_to_process:
             })
     
             # Process the message in the context of this chat
-            _handle_direct_llm_call(
-            current_lc_messages: list[BaseMessage],
-            hist_valid: bool,
-            current_active_hist_idx: int | None,
-            is_rag_call: bool = False,
-            source_description: str = "llm_direct"
-        ) -> None:
+            def _handle_direct_llm_call(
+                current_lc_messages: list[BaseMessage],
+                hist_valid: bool,
+                current_active_hist_idx: int | None,
+                is_rag_call: bool = False,
+                source_description: str = "llm_direct"
+            ) -> None:
             """Handles direct LLM invocation, including tool binding and tool call loop."""
             bound_llm = st.session_state.openai_client # type: ignore
             # Conditionally add non-MCP tools.

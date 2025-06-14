@@ -961,8 +961,7 @@ with col1:
 with col2:
     if "send_to_all_chats" not in st.session_state:
         st.session_state.send_to_all_chats = False
-    if st.button("All Chats" if not st.session_state.send_to_all_chats else "Current Chat", key="toggle_send_to_all"):
-        st.session_state.send_to_all_chats = not st.session_state.send_to_all_chats
+    st.toggle("All Chats" if not st.session_state.send_to_all_chats else "Current Chat", key="toggle_send_to_all")
 
 final_prompt_to_process = None
 if prompt_from_redo:

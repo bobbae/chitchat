@@ -1015,7 +1015,14 @@ if final_prompt_to_process:
             st.rerun()
         elif current_hist_valid_for_prompt:
             # Send to current chat only and process
-            _handle_chat_message(final_prompt_to_process, active_history_idx)
+            current_history = st.session_state.histories[active_history_idx]
+            _handle_chat_message(
+                final_prompt_to_process,
+                active_history_idx,
+                current_history["provider"],
+                current_history["model"],
+                current_history.get("base_url", "")
+            )
             # Display of this user message will be handled by the main message display loop on st.rerun or at end of script
 
         langchain_conversation_messages: list[BaseMessage] = []
@@ -1106,7 +1113,11 @@ if final_prompt_to_process:
                 }
             })
     
-            # Process the message in the context of this chat
+            # Get context variables from parent scope
+            current_hist_valid_for_prompt = hist_idx is not None and 0 <= hist_idx < len(st.session_state.histories)
+            active_history_idx = hist_idx
+            langchain_conversation_messages = [convert_dict_to_langchain_message(msg) for msg in st.session_state.histories[hist_idx]["messages"]]
+
             def _handle_direct_llm_call(
                 current_lc_messages: list[BaseMessage],
                 hist_valid: bool,
@@ -1216,7 +1227,13 @@ if final_prompt_to_process:
                     st.stop()
             elif st.session_state.rag_enabled_by_user and rag_active_for_this_prompt: # RAG toggle is ON and RAG context was found
                 st.toast("Using LLM directly with RAG context.", icon="📄")
-                _handle_direct_llm_call(langchain_conversation_messages, current_hist_valid_for_prompt, active_history_idx, is_rag_call=True, source_description="llm_direct_with_rag")
+                _handle_direct_llm_call(
+                    langchain_conversation_messages,
+                    current_hist_valid_for_prompt,
+                    active_history_idx,
+                    is_rag_call=True,
+                    source_description="llm_direct_with_rag"
+                )
             elif st.session_state.mcp_enabled_by_user and st.session_state.mcp_agent : # MCP Toggle ON and MCPAgent is active (and RAG was not used for this prompt)
                 with st.spinner("Agent is working..."):
                     try:
@@ -1261,7 +1278,13 @@ if final_prompt_to_process:
                             )
             else: # Fallback: RAG not used for this prompt AND (MCP toggle OFF OR MCPAgent not active) -> Direct LLM
                 st.toast("Using LLM directly to process your request.", icon="🧠") # Adjusted icon for clarity
-                _handle_direct_llm_call(langchain_conversation_messages, current_hist_valid_for_prompt, active_history_idx, is_rag_call=False, source_description="llm_direct_no_rag_no_mcp")
+                _handle_direct_llm_call(
+                    langchain_conversation_messages,
+                    current_hist_valid_for_prompt,
+                    active_history_idx,
+                    is_rag_call=False,
+                    source_description="llm_direct_no_rag_no_mcp"
+                )
             
             # Rerun to display all new messages, including tool interactions
             st.rerun()

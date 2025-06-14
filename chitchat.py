@@ -50,6 +50,135 @@ DEFAULT_PROVIDER_MODELS = {
 
 st.set_page_config(page_title="Chit-Chat with Models", layout="wide")
 
+def _handle_direct_llm_call(
+    current_lc_messages: list[BaseMessage],
+    hist_valid: bool,
+    current_active_hist_idx: int | None,
+    is_rag_call: bool = False,
+    source_description: str = "llm_direct"
+) -> None:
+    """Handles direct LLM invocation, including tool binding and tool call loop."""
+    bound_llm = st.session_state.openai_client # type: ignore
+    # Conditionally add non-MCP tools.
+    if st.session_state.current_provider not in ["sambanova", "ollama"]:
+        if bound_llm:
+            tools_to_bind = []
+            if "call_rest_api" in available_tools_mapping: # Only bind non-MCP tools
+                tools_to_bind.append(rest_api_tool_definition)
+            
+            if tools_to_bind: 
+                bound_llm = bound_llm.bind_tools(tools_to_bind)
+
+    spinner_text = "Thinking with RAG context..." if is_rag_call else "Thinking..."
+    with st.spinner(spinner_text):
+        if not bound_llm:
+            st.error("LLM client is not properly initialized.")
+            st.stop()
+        # Type: ignore - response will always be AIMessage when using ChatOpenAI
+        response_aimessage = bound_llm.invoke(current_lc_messages)
+    
+    if not response_aimessage or (not response_aimessage.content and not response_aimessage.tool_calls):
+        error_message_ui = "LLM response was empty or did not contain content or tool calls..."
+        st.error(error_message_ui)
+        if hist_valid and current_active_hist_idx is not None:
+            error_metadata = {"source": source_description, "error": "empty_response"}
+            # Try to get rag_details from the input HumanMessage if RAG was intended
+            # The last message in current_lc_messages is the one that would have been augmented
+            relevant_human_message_for_rag_details = current_lc_messages[-1] if current_lc_messages and isinstance(current_lc_messages[-1], HumanMessage) else None
+            if is_rag_call and relevant_human_message_for_rag_details and \
+               hasattr(relevant_human_message_for_rag_details, 'metadata') and relevant_human_message_for_rag_details.metadata.get('rag_details'):
+                error_metadata["rag_details"] = current_lc_messages[0].metadata['rag_details']
+            st.session_state.histories[current_active_hist_idx]["messages"].append(
+                {
+                    "role": "assistant", 
+                    "content": "[Error: LLM returned no valid response content or tool calls]",
+                    "metadata": error_metadata
+                }
+            )
+        st.rerun(); st.stop()
+
+    parsed_tool_calls = response_aimessage.tool_calls
+
+    if parsed_tool_calls:
+        if hist_valid and current_active_hist_idx is not None:
+            ai_message_metadata = {"source": source_description, "tool_caller_type": "llm_direct"}
+            relevant_human_message_for_rag_details = current_lc_messages[-2] if len(current_lc_messages) > 1 and isinstance(current_lc_messages[-2], HumanMessage) else None # -2 because AIMessage was just appended
+            if is_rag_call and relevant_human_message_for_rag_details and \
+               hasattr(relevant_human_message_for_rag_details, 'metadata') and relevant_human_message_for_rag_details.metadata.get('rag_details'):
+                 ai_message_metadata["rag_details"] = relevant_human_message_for_rag_details.metadata['rag_details']
+            response_aimessage.metadata = ai_message_metadata # Add metadata to AIMessage object
+            st.session_state.histories[current_active_hist_idx]["messages"].append(
+                convert_aimessage_to_storage_dict(response_aimessage) # This will now store metadata
+            )
+        current_lc_messages.append(response_aimessage)
+
+        for tool_call_data in parsed_tool_calls:
+            function_name = tool_call_data["name"]
+            function_to_call = available_tools_mapping.get(function_name)
+            if function_to_call:
+                try:
+                    if function_name == "call_rest_api": st.toast(f"Attempting to use tool: {function_name}", icon="🚀")
+                    function_args = tool_call_data["args"]; tool_output = function_to_call(**function_args)
+                except Exception as e: tool_output = f"Error parsing arguments or calling tool {function_name}: {e}"
+            else: tool_output = f"Error: Tool '{function_name}' not found in available_tools_mapping."
+            tool_message_for_storage = {
+                "role": "tool", 
+                "tool_call_id": tool_call_data["id"], 
+                "name": function_name, 
+                "content": tool_output,
+                "metadata": {"tool_executor": "chitchat_manual_tool"}
+            }
+            if hist_valid and current_active_hist_idx is not None: st.session_state.histories[current_active_hist_idx]["messages"].append(tool_message_for_storage)
+            current_lc_messages.append(ToolMessage(content=tool_output, tool_call_id=tool_call_data["id"]))
+        with st.spinner("Processing tool results..."):
+            if not bound_llm: st.error("LLM client became uninitialized."); st.stop()
+            second_response_aimessage = bound_llm.invoke(current_lc_messages)
+        if hist_valid and current_active_hist_idx is not None:
+            second_ai_message_metadata = {"source": source_description, "after_tool_call": True}
+            # Find the original HumanMessage that might have RAG details
+            original_human_message_for_rag = next((m for m in reversed(current_lc_messages) if isinstance(m, HumanMessage) and hasattr(m, 'metadata') and m.metadata.get('rag_details')), None)
+            if is_rag_call and original_human_message_for_rag:
+                 second_ai_message_metadata["rag_details"] = original_human_message_for_rag.metadata['rag_details']
+            second_response_aimessage.metadata = second_ai_message_metadata
+            st.session_state.histories[current_active_hist_idx]["messages"].append(convert_aimessage_to_storage_dict(second_response_aimessage))
+    else: # No tool calls
+        if response_aimessage.content and hist_valid and current_active_hist_idx is not None:
+            ai_message_metadata = {"source": source_description}
+            relevant_human_message_for_rag_details = current_lc_messages[-1] if current_lc_messages and isinstance(current_lc_messages[-1], HumanMessage) else None
+            if is_rag_call and relevant_human_message_for_rag_details and \
+               hasattr(relevant_human_message_for_rag_details, 'metadata') and relevant_human_message_for_rag_details.metadata.get('rag_details'):
+                ai_message_metadata["rag_details"] = relevant_human_message_for_rag_details.metadata['rag_details']
+            if is_rag_call and st.session_state.mcp_enabled_by_user: # Both RAG and MCP were enabled
+                ai_message_metadata["processing_conflict_note"] = "rag_mcp_conflict_rag_precedence"
+            response_aimessage.metadata = ai_message_metadata
+            st.session_state.histories[current_active_hist_idx]["messages"].append(convert_aimessage_to_storage_dict(response_aimessage))
+
+def _handle_chat_message(
+    prompt: str, 
+    hist_idx: int,
+    current_provider: str,
+    current_model: str,
+    current_base_url: str
+) -> None:
+    """Handle adding user message and processing response for a specific chat"""
+    # Add user message to target history
+    st.session_state.histories[hist_idx]["messages"].append({
+        "role": "user", 
+        "content": prompt,
+        "metadata": {
+            "source": "user_input", 
+            "sent_to_all": hist_idx != st.session_state.current_history,
+            "provider": current_provider,
+            "model": current_model
+        }
+    })
+
+    # Get context variables from parent scope
+    current_hist_valid_for_prompt = hist_idx is not None and 0 <= hist_idx < len(st.session_state.histories)
+    active_history_idx = hist_idx
+    langchain_conversation_messages = [convert_dict_to_langchain_message(msg) for msg in st.session_state.histories[hist_idx]["messages"]]
+    _handle_direct_llm_call(langchain_conversation_messages, current_hist_valid_for_prompt, active_history_idx)
+
 def try_initialize_mcp_agent():
     """Initializes or updates the MCPAgent if both LLM and MCPClient are available."""
     if st.session_state.openai_client and st.session_state.mcp_client:
@@ -1093,38 +1222,6 @@ if final_prompt_to_process:
             if rag_info_dict.get("toggle_status") == "enabled" and rag_info_dict.get("context_status") == "found":
                 rag_active_for_this_prompt = True
 
-        def _handle_chat_message(
-            prompt: str, 
-            hist_idx: int,
-            current_provider: str,
-            current_model: str,
-            current_base_url: str
-        ) -> None:
-            """Handle adding user message and processing response for a specific chat"""
-            # Add user message to target history
-            st.session_state.histories[hist_idx]["messages"].append({
-                "role": "user", 
-                "content": prompt,
-                "metadata": {
-                    "source": "user_input", 
-                    "sent_to_all": hist_idx != st.session_state.current_history,
-                    "provider": current_provider,
-                    "model": current_model
-                }
-            })
-    
-            # Get context variables from parent scope
-            current_hist_valid_for_prompt = hist_idx is not None and 0 <= hist_idx < len(st.session_state.histories)
-            active_history_idx = hist_idx
-            langchain_conversation_messages = [convert_dict_to_langchain_message(msg) for msg in st.session_state.histories[hist_idx]["messages"]]
-
-            def _handle_direct_llm_call(
-                current_lc_messages: list[BaseMessage],
-                hist_valid: bool,
-                current_active_hist_idx: int | None,
-                is_rag_call: bool = False,
-                source_description: str = "llm_direct"
-            ) -> None:
                 """Handles direct LLM invocation, including tool binding and tool call loop."""
                 bound_llm = st.session_state.openai_client # type: ignore
                 # Conditionally add non-MCP tools.

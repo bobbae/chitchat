@@ -983,20 +983,33 @@ if final_prompt_to_process:
             original_current_history = st.session_state.current_history
             
             async def process_chat_async(hist_idx):
-                # Switch to target chat context
-                st.session_state.current_history = hist_idx
-                # Process message in this chat's context
-                _handle_chat_message(final_prompt_to_process, hist_idx)
-                # Return to original chat context
-                st.session_state.current_history = original_current_history
+                # Process message in target chat's context without changing global state
+                current_history = st.session_state.histories[hist_idx]
+                _handle_chat_message(
+                    prompt=final_prompt_to_process,
+                    hist_idx=hist_idx,
+                    current_provider=current_history["provider"],
+                    current_model=current_history["model"],
+                    current_base_url=current_history.get("base_url", "")
+                )
             
-            # Run all chats concurrently
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            tasks = [loop.create_task(process_chat_async(hist_idx)) 
-                    for hist_idx in range(len(st.session_state.histories))]
-            loop.run_until_complete(asyncio.gather(*tasks))
-            loop.close()
+            # Run all chats concurrently with proper context isolation
+            original_provider = st.session_state.current_provider
+            original_model = st.session_state.current_model
+            original_base_url = st.session_state.base_url
+            
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                tasks = [loop.create_task(process_chat_async(hist_idx)) 
+                        for hist_idx in range(len(st.session_state.histories))]
+                loop.run_until_complete(asyncio.gather(*tasks))
+            finally:
+                # Restore original context after all async operations
+                st.session_state.current_provider = original_provider
+                st.session_state.current_model = original_model
+                st.session_state.base_url = original_base_url
+                loop.close()
             
             st.toast(f"Processed {len(tasks)} chats asynchronously!", icon="🚀")
             st.rerun()
@@ -1073,13 +1086,24 @@ if final_prompt_to_process:
             if rag_info_dict.get("toggle_status") == "enabled" and rag_info_dict.get("context_status") == "found":
                 rag_active_for_this_prompt = True
 
-        def _handle_chat_message(prompt: str, hist_idx: int) -> None:
+        def _handle_chat_message(
+            prompt: str, 
+            hist_idx: int,
+            current_provider: str,
+            current_model: str,
+            current_base_url: str
+        ) -> None:
             """Handle adding user message and processing response for a specific chat"""
             # Add user message to target history
             st.session_state.histories[hist_idx]["messages"].append({
                 "role": "user", 
                 "content": prompt,
-                "metadata": {"source": "user_input", "sent_to_all": hist_idx != st.session_state.current_history}
+                "metadata": {
+                    "source": "user_input", 
+                    "sent_to_all": hist_idx != st.session_state.current_history,
+                    "provider": current_provider,
+                    "model": current_model
+                }
             })
     
             # Process the message in the context of this chat

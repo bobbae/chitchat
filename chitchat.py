@@ -979,20 +979,30 @@ if final_prompt_to_process:
                                      0 <= active_history_idx < len(st.session_state.histories) # type: ignore
 
         if st.session_state.send_to_all_chats:
-            # Send to all available chats
-            for hist_idx, history_entry in enumerate(st.session_state.histories):
-                history_entry["messages"].append({
-                    "role": "user", 
-                    "content": final_prompt_to_process,
-                    "metadata": {"source": "user_input", "sent_to_all": True}
-                })
+            # Send to all available chats and process async
+            original_current_history = st.session_state.current_history
+            
+            async def process_chat_async(hist_idx):
+                # Switch to target chat context
+                st.session_state.current_history = hist_idx
+                # Process message in this chat's context
+                _handle_chat_message(final_prompt_to_process, hist_idx)
+                # Return to original chat context
+                st.session_state.current_history = original_current_history
+            
+            # Run all chats concurrently
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            tasks = [loop.create_task(process_chat_async(hist_idx)) 
+                    for hist_idx in range(len(st.session_state.histories))]
+            loop.run_until_complete(asyncio.gather(*tasks))
+            loop.close()
+            
+            st.toast(f"Processed {len(tasks)} chats asynchronously!", icon="🚀")
+            st.rerun()
         elif current_hist_valid_for_prompt:
-            # Send to current chat only
-            st.session_state.histories[active_history_idx]["messages"].append({
-                "role": "user", 
-                "content": final_prompt_to_process,
-                "metadata": {"source": "user_input"}
-            })
+            # Send to current chat only and process
+            _handle_chat_message(final_prompt_to_process, active_history_idx)
             # Display of this user message will be handled by the main message display loop on st.rerun or at end of script
 
         langchain_conversation_messages: list[BaseMessage] = []
@@ -1063,7 +1073,17 @@ if final_prompt_to_process:
             if rag_info_dict.get("toggle_status") == "enabled" and rag_info_dict.get("context_status") == "found":
                 rag_active_for_this_prompt = True
 
-        def _handle_direct_llm_call(
+        def _handle_chat_message(prompt: str, hist_idx: int) -> None:
+            """Handle adding user message and processing response for a specific chat"""
+            # Add user message to target history
+            st.session_state.histories[hist_idx]["messages"].append({
+                "role": "user", 
+                "content": prompt,
+                "metadata": {"source": "user_input", "sent_to_all": hist_idx != st.session_state.current_history}
+            })
+    
+            # Process the message in the context of this chat
+            _handle_direct_llm_call(
             current_lc_messages: list[BaseMessage],
             hist_valid: bool,
             current_active_hist_idx: int | None,

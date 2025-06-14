@@ -1168,7 +1168,7 @@ if final_prompt_to_process:
                 parsed_tool_calls = response_aimessage.tool_calls
 
                 if parsed_tool_calls:
-                if hist_valid and current_active_hist_idx is not None:
+                    if hist_valid and current_active_hist_idx is not None:
                     ai_message_metadata = {"source": source_description, "tool_caller_type": "llm_direct"}
                     relevant_human_message_for_rag_details = current_lc_messages[-2] if len(current_lc_messages) > 1 and isinstance(current_lc_messages[-2], HumanMessage) else None # -2 because AIMessage was just appended
                     if is_rag_call and relevant_human_message_for_rag_details and \

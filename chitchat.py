@@ -27,7 +27,8 @@ DEFAULT_PROVIDER_URLS = {
     "ollama": "http://localhost:11434/v1",
     "sambanova": "https://api.sambanova.ai/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
-    "anthropic": "https://api.anthropic.com/v1" # Or your specific Anthropic endpoint
+    "anthropic": "https://api.anthropic.com/v1", # Or your specific Anthropic endpoint
+    "together": "https://api.together.xyz/v1"
 }
 
 PROVIDER_API_KEY_ENV_VARS = {
@@ -36,7 +37,8 @@ PROVIDER_API_KEY_ENV_VARS = {
     "openrouter": "OPENROUTER_API_KEY",
     "gemini": "GEMINI_API_KEY", # For a compatible endpoint
     "sambanova": "SAMBANOVA_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY"
+    "anthropic": "ANTHROPIC_API_KEY",
+    "together": "TOGETHER_API_KEY"
 }
 
 DEFAULT_PROVIDER_MODELS = {
@@ -45,7 +47,8 @@ DEFAULT_PROVIDER_MODELS = {
     "openrouter": "meta-llama/llama-4-maverick:free", 
     "sambanova": "DeepSeek-R1",
     "gemini": "gemini-1.5-flash",
-    "anthropic": "claude-3-opus-20240229" # Example Anthropic model
+    "anthropic": "claude-3-opus-20240229", # Example Anthropic model
+    "together": "meta-llama/Llama-3-8b-chat-hf"
 }
 
 st.set_page_config(page_title="Chit-Chat with Models", layout="wide")
@@ -956,14 +959,17 @@ available_tools_mapping = {
     "call_rest_api": call_rest_api, # Temporarily commented out
 } # This mapping is for non-MCP tools
 # Accept user input
-st.toggle("Send to all active sessions", key="send_to_all_sessions")
 prompt_from_redo = st.session_state.pop("force_process_prompt", None)
-prompt_from_chat_input = st.chat_input("What is your question?")
+
+with st.form(key="chat_input_form", clear_on_submit=True):
+    prompt_from_chat_input = st.text_input("What is your question?", key="user_prompt_input")
+    st.toggle("Send to all active sessions", key="send_to_all_sessions")
+    submit_button = st.form_submit_button(label='Send')
 
 final_prompt_to_process = None
 if prompt_from_redo:
     final_prompt_to_process = prompt_from_redo
-elif prompt_from_chat_input:
+elif submit_button and prompt_from_chat_input:
     final_prompt_to_process = prompt_from_chat_input
 
 if final_prompt_to_process:

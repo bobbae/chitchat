@@ -1211,15 +1211,15 @@ if final_prompt_to_process:
                     st.session_state.histories[current_active_hist_idx]["messages"].append(convert_aimessage_to_storage_dict(second_response_aimessage))
                 else: # No tool calls
                     if response_aimessage.content and hist_valid and current_active_hist_idx is not None:
-                    ai_message_metadata = {"source": source_description}
-                    relevant_human_message_for_rag_details = current_lc_messages[-1] if current_lc_messages and isinstance(current_lc_messages[-1], HumanMessage) else None
-                    if is_rag_call and relevant_human_message_for_rag_details and \
-                       hasattr(relevant_human_message_for_rag_details, 'metadata') and relevant_human_message_for_rag_details.metadata.get('rag_details'):
-                        ai_message_metadata["rag_details"] = relevant_human_message_for_rag_details.metadata['rag_details']
-                    if is_rag_call and st.session_state.mcp_enabled_by_user: # Both RAG and MCP were enabled
-                        ai_message_metadata["processing_conflict_note"] = "rag_mcp_conflict_rag_precedence"
-                    response_aimessage.metadata = ai_message_metadata
-                    st.session_state.histories[current_active_hist_idx]["messages"].append(convert_aimessage_to_storage_dict(response_aimessage))
+                        ai_message_metadata = {"source": source_description}
+                        relevant_human_message_for_rag_details = current_lc_messages[-1] if current_lc_messages and isinstance(current_lc_messages[-1], HumanMessage) else None
+                        if is_rag_call and relevant_human_message_for_rag_details and \
+                           hasattr(relevant_human_message_for_rag_details, 'metadata') and relevant_human_message_for_rag_details.metadata.get('rag_details'):
+                            ai_message_metadata["rag_details"] = relevant_human_message_for_rag_details.metadata['rag_details']
+                        if is_rag_call and st.session_state.mcp_enabled_by_user: # Both RAG and MCP were enabled
+                            ai_message_metadata["processing_conflict_note"] = "rag_mcp_conflict_rag_precedence"
+                        response_aimessage.metadata = ai_message_metadata
+                        st.session_state.histories[current_active_hist_idx]["messages"].append(convert_aimessage_to_storage_dict(response_aimessage))
 
         try:
             if not st.session_state.current_model:

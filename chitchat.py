@@ -955,7 +955,14 @@ available_tools_mapping = {
 } # This mapping is for non-MCP tools
 # Accept user input
 prompt_from_redo = st.session_state.pop("force_process_prompt", None)
-prompt_from_chat_input = st.chat_input("What is your question?")
+col1, col2 = st.columns([0.8, 0.2])
+with col1:
+    prompt_from_chat_input = st.chat_input("What is your question?")
+with col2:
+    if "send_to_all_chats" not in st.session_state:
+        st.session_state.send_to_all_chats = False
+    if st.button("All Chats" if not st.session_state.send_to_all_chats else "Current Chat", key="toggle_send_to_all"):
+        st.session_state.send_to_all_chats = not st.session_state.send_to_all_chats
 
 final_prompt_to_process = None
 if prompt_from_redo:
@@ -972,14 +979,21 @@ if final_prompt_to_process:
         current_hist_valid_for_prompt = active_history_idx is not None and \
                                      0 <= active_history_idx < len(st.session_state.histories) # type: ignore
 
-        if current_hist_valid_for_prompt:
-            st.session_state.histories[active_history_idx]["messages"].append(
-                {
+        if st.session_state.send_to_all_chats:
+            # Send to all available chats
+            for hist_idx, history_entry in enumerate(st.session_state.histories):
+                history_entry["messages"].append({
                     "role": "user", 
                     "content": final_prompt_to_process,
-                    "metadata": {"source": "user_input"}
-                }
-            )
+                    "metadata": {"source": "user_input", "sent_to_all": True}
+                })
+        elif current_hist_valid_for_prompt:
+            # Send to current chat only
+            st.session_state.histories[active_history_idx]["messages"].append({
+                "role": "user", 
+                "content": final_prompt_to_process,
+                "metadata": {"source": "user_input"}
+            })
             # Display of this user message will be handled by the main message display loop on st.rerun or at end of script
 
         langchain_conversation_messages: list[BaseMessage] = []

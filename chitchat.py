@@ -1222,63 +1222,14 @@ if final_prompt_to_process:
             if rag_info_dict.get("toggle_status") == "enabled" and rag_info_dict.get("context_status") == "found":
                 rag_active_for_this_prompt = True
 
-                """Handles direct LLM invocation, including tool binding and tool call loop."""
-                bound_llm = st.session_state.openai_client # type: ignore
-                # Conditionally add non-MCP tools.
-                if st.session_state.current_provider not in ["sambanova", "ollama"]:
-                    if bound_llm:
-                        tools_to_bind = []
-                        if "call_rest_api" in available_tools_mapping: # Only bind non-MCP tools
-                            tools_to_bind.append(rest_api_tool_definition)
-                        
-                        if tools_to_bind: 
-                            bound_llm = bound_llm.bind_tools(tools_to_bind)
-
-                spinner_text = "Thinking with RAG context..." if is_rag_call else "Thinking..."
-                with st.spinner(spinner_text):
-                    if not bound_llm:
-                        st.error("LLM client is not properly initialized.")
-                        st.stop()
-                    # Type: ignore - response will always be AIMessage when using ChatOpenAI
-                    response_aimessage = bound_llm.invoke(current_lc_messages)
-            
-                if not response_aimessage or (not response_aimessage.content and not response_aimessage.tool_calls):
-                    error_message_ui = "LLM response was empty or did not contain content or tool calls..."
-                    st.error(error_message_ui)
-                if hist_valid and current_active_hist_idx is not None:
-                    error_metadata = {"source": source_description, "error": "empty_response"}
-                    # Try to get rag_details from the input HumanMessage if RAG was intended
-                    # The last message in current_lc_messages is the one that would have been augmented
-                    relevant_human_message_for_rag_details = current_lc_messages[-1] if current_lc_messages and isinstance(current_lc_messages[-1], HumanMessage) else None
-                    if is_rag_call and relevant_human_message_for_rag_details and \
-                       hasattr(relevant_human_message_for_rag_details, 'metadata') and relevant_human_message_for_rag_details.metadata.get('rag_details'):
-                        error_metadata["rag_details"] = current_lc_messages[0].metadata['rag_details']
-                    st.session_state.histories[current_active_hist_idx]["messages"].append(
-                        {
-                            "role": "assistant", 
-                            "content": "[Error: LLM returned no valid response content or tool calls]",
-                            "metadata": error_metadata
-                        }
-                    )
-                st.rerun(); st.stop()
-
-                parsed_tool_calls = response_aimessage.tool_calls
-
-                if parsed_tool_calls:
-                    if hist_valid and current_active_hist_idx is not None:
-                        ai_message_metadata = {"source": source_description, "tool_caller_type": "llm_direct"}
-                    relevant_human_message_for_rag_details = current_lc_messages[-2] if len(current_lc_messages) > 1 and isinstance(current_lc_messages[-2], HumanMessage) else None # -2 because AIMessage was just appended
-                    if is_rag_call and relevant_human_message_for_rag_details and \
-                       hasattr(relevant_human_message_for_rag_details, 'metadata') and relevant_human_message_for_rag_details.metadata.get('rag_details'):
-                         ai_message_metadata["rag_details"] = relevant_human_message_for_rag_details.metadata['rag_details']
-                    response_aimessage.metadata = ai_message_metadata # Add metadata to AIMessage object
-                    st.session_state.histories[current_active_hist_idx]["messages"].append(
-                        convert_aimessage_to_storage_dict(response_aimessage) # This will now store metadata
-                    )
-                current_lc_messages.append(response_aimessage)
-
-                for tool_call_data in parsed_tool_calls:
-                    function_name = tool_call_data["name"]
+                # Call the top-level _handle_direct_llm_call function with proper parameters
+                _handle_direct_llm_call(
+                    current_lc_messages=langchain_conversation_messages,
+                    hist_valid=current_hist_valid_for_prompt,
+                    current_active_hist_idx=active_history_idx,
+                    is_rag_call=rag_active_for_this_prompt,
+                    source_description="llm_direct_with_rag" if rag_active_for_this_prompt else "llm_direct"
+                )
                     function_to_call = available_tools_mapping.get(function_name)
                     if function_to_call:
                         try:

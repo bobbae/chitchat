@@ -1126,28 +1126,28 @@ if final_prompt_to_process:
                 source_description: str = "llm_direct"
             ) -> None:
                 """Handles direct LLM invocation, including tool binding and tool call loop."""
-            bound_llm = st.session_state.openai_client # type: ignore
-            # Conditionally add non-MCP tools.
-            if st.session_state.current_provider not in ["sambanova", "ollama"]:
-                if bound_llm:
-                    tools_to_bind = []
-                    if "call_rest_api" in available_tools_mapping: # Only bind non-MCP tools
-                        tools_to_bind.append(rest_api_tool_definition)
-                    
-                    if tools_to_bind: 
-                        bound_llm = bound_llm.bind_tools(tools_to_bind)
+                bound_llm = st.session_state.openai_client # type: ignore
+                # Conditionally add non-MCP tools.
+                if st.session_state.current_provider not in ["sambanova", "ollama"]:
+                    if bound_llm:
+                        tools_to_bind = []
+                        if "call_rest_api" in available_tools_mapping: # Only bind non-MCP tools
+                            tools_to_bind.append(rest_api_tool_definition)
+                        
+                        if tools_to_bind: 
+                            bound_llm = bound_llm.bind_tools(tools_to_bind)
 
-            spinner_text = "Thinking with RAG context..." if is_rag_call else "Thinking..."
-            with st.spinner(spinner_text):
-                if not bound_llm:
-                    st.error("LLM client is not properly initialized.")
-                    st.stop()
-                # Type: ignore - response will always be AIMessage when using ChatOpenAI
-                response_aimessage = bound_llm.invoke(current_lc_messages)
+                spinner_text = "Thinking with RAG context..." if is_rag_call else "Thinking..."
+                with st.spinner(spinner_text):
+                    if not bound_llm:
+                        st.error("LLM client is not properly initialized.")
+                        st.stop()
+                    # Type: ignore - response will always be AIMessage when using ChatOpenAI
+                    response_aimessage = bound_llm.invoke(current_lc_messages)
             
-            if not response_aimessage or (not response_aimessage.content and not response_aimessage.tool_calls):
-                error_message_ui = "LLM response was empty or did not contain content or tool calls..."
-                st.error(error_message_ui)
+                if not response_aimessage or (not response_aimessage.content and not response_aimessage.tool_calls):
+                    error_message_ui = "LLM response was empty or did not contain content or tool calls..."
+                    st.error(error_message_ui)
                 if hist_valid and current_active_hist_idx is not None:
                     error_metadata = {"source": source_description, "error": "empty_response"}
                     # Try to get rag_details from the input HumanMessage if RAG was intended
@@ -1165,9 +1165,9 @@ if final_prompt_to_process:
                     )
                 st.rerun(); st.stop()
 
-            parsed_tool_calls = response_aimessage.tool_calls
+                parsed_tool_calls = response_aimessage.tool_calls
 
-            if parsed_tool_calls:
+                if parsed_tool_calls:
                 if hist_valid and current_active_hist_idx is not None:
                     ai_message_metadata = {"source": source_description, "tool_caller_type": "llm_direct"}
                     relevant_human_message_for_rag_details = current_lc_messages[-2] if len(current_lc_messages) > 1 and isinstance(current_lc_messages[-2], HumanMessage) else None # -2 because AIMessage was just appended

@@ -1090,7 +1090,7 @@ if final_prompt_to_process:
                 is_rag_call: bool = False,
                 source_description: str = "llm_direct"
             ) -> None:
-            """Handles direct LLM invocation, including tool binding and tool call loop."""
+                """Handles direct LLM invocation, including tool binding and tool call loop."""
             bound_llm = st.session_state.openai_client # type: ignore
             # Conditionally add non-MCP tools.
             if st.session_state.current_provider not in ["sambanova", "ollama"]:

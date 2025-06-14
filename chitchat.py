@@ -445,7 +445,7 @@ with st.sidebar:
                 st.session_state.pending_history_activation_index = selected_hist
                 st.rerun()
         else:
-            st.caption("No chats available. Start a new chat by applying a model configuration.")
+            st.caption("No chats available. Start a new chat by applying a new chat configuration. Or load existing chat histories from a JSON file.")
         
         # Button to clear the currently selected chat history (moved here)
         if st.session_state.current_history is not None and st.session_state.histories: # Only show if a history is active
